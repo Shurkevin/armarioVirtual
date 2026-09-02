@@ -1,0 +1,33 @@
+{
+  "name": "armario-virtual",
+  "version": "0.0.0.0.0.1",
+  "main": "index.ts",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "server": "node --watch server/index.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@expo/vector-icons": "^15.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "expo": "~54.0.0",
+    "expo-image-manipulator": "~14.0.8",
+    "expo-image-picker": "~17.0.11",
+    "expo-status-bar": "~3.0.8",
+    "express": "^5.2.1",
+    "multer": "^2.3.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.10",
+    "typescript": "~5.9.2"
+  },
+  "private": true,
+  "packageManager": "pnpm@11.19.0"
+}

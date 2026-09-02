@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "Armario",
+    "slug": "armario-virtual",
+    "version": "0.0.0.0.0.1",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "android": { "package": "com.armariovirtual.app" },
+    "ios": { "bundleIdentifier": "com.armariovirtual.app" },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Armario necesita acceder a tus fotos para que puedas añadir tus outfits.",
+          "cameraPermission": false
+        }
+      ]
+    ]
+  }
+}
