@@ -1,4 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
+import type { Session } from '@supabase/supabase-js';
 import {
   ActivityIndicator,
   Alert,
@@ -17,9 +19,15 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { Feather } from '@expo/vector-icons';
+import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
+import { makeRedirectUri } from 'expo-auth-session';
+import * as Linking from 'expo-linking';
+import * as WebBrowser from 'expo-web-browser';
+import { supabase } from './lib/supabase';
+
+WebBrowser.maybeCompleteAuthSession();
 
 type Tab = 'inicio' | 'armario' | 'outfits' | 'captura' | 'compras' | 'perfil';
 type AddStage = 'upload' | 'person' | 'review' | 'duplicates';
@@ -299,12 +307,264 @@ function EmptyScreen({ tab }: { tab: Exclude<Tab, 'captura'> }) {
   );
 }
 
-function Profile({ onBack }: { onBack: () => void }) {
+function LoginScreen() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [mode, setMode] = useState<'signIn' | 'signUp'>('signIn');
+  const [loading, setLoading] = useState<'email' | 'google' | 'apple' | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [focusedField, setFocusedField] = useState<'email' | 'password' | null>(null);
+
+  const redirectTo = makeRedirectUri({ scheme: 'armario-virtual', path: 'auth/callback' });
+
+  const signInWithProvider = async (provider: 'google' | 'apple') => {
+    setLoading(provider);
+    setMessage(null);
+    try {
+      console.log('[Supabase] OAuth redirect URL:', redirectTo);
+      const { data, error } = await supabase.auth.signInWithOAuth({ provider, options: { redirectTo, skipBrowserRedirect: true } });
+      if (error) throw error;
+      if (!data.url) throw new Error('No hemos recibido una URL de autorización.');
+      const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo);
+      const returnedUrl = 'url' in result && result.url ? result.url : null;
+      const safeReturnedUrl = returnedUrl?.replace(/([?&#](?:code|access_token|refresh_token|error_description)=)[^&#]*/g, '$1[redacted]') || null;
+      console.log('[Supabase] Resultado del navegador OAuth:', { type: result.type, url: safeReturnedUrl });
+      if (result.type === 'success' && result.url) {
+        const parsed = Linking.parse(result.url);
+        const code = typeof parsed.queryParams?.code === 'string' ? parsed.queryParams.code : null;
+        if (code) {
+          const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code);
+          if (exchangeError) throw exchangeError;
+        } else {
+          const fragment = result.url.split('#')[1] || '';
+          const fragmentParams = new URLSearchParams(fragment);
+          const accessToken = fragmentParams.get('access_token');
+          const refreshToken = fragmentParams.get('refresh_token');
+          if (!accessToken || !refreshToken) throw new Error('Google no ha devuelto una sesión válida a la app.');
+          const { error: sessionError } = await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken });
+          if (sessionError) throw sessionError;
+        }
+      } else if (result.type !== 'cancel' && result.type !== 'dismiss') {
+        throw new Error('La autorización no se ha completado.');
+      }
+    } catch (error) {
+      console.error(`[Supabase] Error con ${provider}:`, error);
+      setMessage(error instanceof Error ? error.message : 'No hemos podido iniciar sesión.');
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const submitEmail = async () => {
+    if (!email.trim() || password.length < 6) {
+      setMessage('Introduce un correo válido y una contraseña de al menos 6 caracteres.');
+      return;
+    }
+    setLoading('email');
+    setMessage(null);
+    try {
+      const credentials = { email: email.trim().toLocaleLowerCase(), password };
+      const result = mode === 'signIn'
+        ? await supabase.auth.signInWithPassword(credentials)
+        : await supabase.auth.signUp({ ...credentials, options: { emailRedirectTo: redirectTo } });
+      if (result.error) throw result.error;
+      if (mode === 'signUp' && !result.data.session) setMessage('Te hemos enviado un correo para confirmar tu cuenta.');
+    } catch (error) {
+      console.error('[Supabase] Error con correo:', error);
+      setMessage(error instanceof Error ? error.message : 'No hemos podido completar el acceso.');
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const resetPassword = async () => {
+    const normalizedEmail = email.trim().toLocaleLowerCase();
+    if (!normalizedEmail) {
+      setMessage('Escribe tu correo para que podamos enviarte el enlace de recuperación.');
+      return;
+    }
+    setLoading('email');
+    setMessage(null);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(normalizedEmail, { redirectTo });
+      if (error) throw error;
+      setMessage('Te hemos enviado un enlace para restablecer tu contraseña.');
+    } catch (error) {
+      console.error('[Supabase] Error al recuperar la contraseña:', error);
+      setMessage(error instanceof Error ? error.message : 'No hemos podido enviar el enlace de recuperación.');
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  return <SafeAreaView style={styles.safe}>
+    <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} />
+    <ScrollView contentContainerStyle={styles.loginScroll} keyboardShouldPersistTaps="handled">
+      <View style={styles.loginHero}>
+        <View style={styles.loginWordmark}><View style={styles.loginWordmarkDot} /><Text style={styles.loginWordmarkText}>ARMARIO</Text><Text style={styles.loginWordmarkSub}>PERSONAL</Text></View>
+        <View style={styles.loginWelcome}>
+          <View style={styles.loginWelcomeCopy}>
+            <Text style={styles.loginWelcomeKicker}>UN ESPACIO PARA TU ESTILO</Text>
+            <Text style={styles.loginWelcomeTitle}>Tu armario,{`\n`}bien pensado.</Text>
+            <Text style={styles.loginWelcomeText}>Organiza lo que tienes y encuentra formas nuevas de llevarlo.</Text>
+          </View>
+          <View style={styles.loginWelcomeArtwork}>
+            <View style={styles.loginWelcomeArch} />
+            <View style={styles.loginWelcomeTile} />
+            <View style={styles.loginWelcomeIcon}><Feather name="layers" size={22} color={COLORS.ink} /></View>
+          </View>
+        </View>
+      </View>
+      <View style={styles.loginCard}>
+        <Text style={styles.loginCardEyebrow}>{mode === 'signIn' ? 'TU ESPACIO PERSONAL' : 'EMPIEZA TU COLECCIÓN'}</Text>
+        <Text style={styles.loginCardTitle}>{mode === 'signIn' ? 'Qué alegría verte de nuevo.' : 'Crea tu armario personal.'}</Text>
+        <Text style={styles.loginCardDescription}>{mode === 'signIn' ? 'Entra para continuar organizando tus looks.' : 'Guarda tus prendas y descubre nuevas combinaciones.'}</Text>
+        <View style={styles.loginFieldGroup}>
+          <Text style={styles.loginFieldLabel}>Correo electrónico</Text>
+          <View style={[styles.loginInputWrap, focusedField === 'email' && styles.loginInputWrapFocused]}>
+            <Feather name="mail" size={17} color={focusedField === 'email' ? COLORS.sageDark : COLORS.muted} />
+            <TextInput value={email} onChangeText={setEmail} onFocus={() => setFocusedField('email')} onBlur={() => setFocusedField(null)} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} autoComplete="email" textContentType="emailAddress" placeholder="tu@email.com" placeholderTextColor="#9B958E" style={styles.loginInput} accessibilityLabel="Correo electrónico" />
+          </View>
+        </View>
+        <View style={styles.loginFieldGroup}>
+          <View style={styles.loginPasswordLabelRow}>
+            <Text style={styles.loginFieldLabel}>Contraseña</Text>
+            {mode === 'signIn' && <TouchableOpacity onPress={() => void resetPassword()} disabled={loading !== null} hitSlop={8} accessibilityRole="button" accessibilityLabel="Recuperar contraseña"><Text style={styles.loginForgot}>¿La has olvidado?</Text></TouchableOpacity>}
+          </View>
+          <View style={[styles.loginInputWrap, focusedField === 'password' && styles.loginInputWrapFocused]}>
+            <Feather name="lock" size={17} color={focusedField === 'password' ? COLORS.sageDark : COLORS.muted} />
+            <TextInput value={password} onChangeText={setPassword} onFocus={() => setFocusedField('password')} onBlur={() => setFocusedField(null)} secureTextEntry={!passwordVisible} autoComplete={mode === 'signIn' ? 'current-password' : 'new-password'} textContentType={mode === 'signIn' ? 'password' : 'newPassword'} placeholder="Mínimo 6 caracteres" placeholderTextColor="#9B958E" style={styles.loginInput} accessibilityLabel="Contraseña" />
+            <TouchableOpacity onPress={() => setPasswordVisible((current) => !current)} hitSlop={8} accessibilityRole="button" accessibilityLabel={passwordVisible ? 'Ocultar contraseña' : 'Mostrar contraseña'}><Feather name={passwordVisible ? 'eye-off' : 'eye'} size={18} color={COLORS.muted} /></TouchableOpacity>
+          </View>
+        </View>
+        <TouchableOpacity disabled={loading !== null} onPress={() => void submitEmail()} style={[styles.loginPrimary, loading === 'email' && styles.buttonDisabled]}><Text style={styles.loginPrimaryText}>{loading === 'email' ? 'Un momento…' : mode === 'signIn' ? 'Iniciar sesión' : 'Crear cuenta'}</Text></TouchableOpacity>
+        <TouchableOpacity disabled={loading !== null} onPress={() => { setMode((current) => current === 'signIn' ? 'signUp' : 'signIn'); setMessage(null); }} style={styles.loginSwitch} accessibilityRole="button"><Text style={styles.loginSwitchPrompt}>{mode === 'signIn' ? '¿Es tu primera vez?' : '¿Ya tienes una cuenta?'}</Text><Text style={styles.loginSwitchText}>{mode === 'signIn' ? ' Crear cuenta' : ' Iniciar sesión'}</Text></TouchableOpacity>
+        <View style={styles.loginDivider}><View style={styles.loginDividerLine} /><Text style={styles.loginDividerText}>O continúa con</Text><View style={styles.loginDividerLine} /></View>
+        <TouchableOpacity disabled={loading !== null} onPress={() => void signInWithProvider('google')} style={[styles.loginSocial, loading === 'google' && styles.buttonDisabled]}><MaterialCommunityIcons name="google" size={19} color="#4285F4" style={styles.loginGoogleIcon} /><Text style={styles.loginSocialText}>{loading === 'google' ? 'Abriendo Google…' : 'Continuar con Google'}</Text></TouchableOpacity>
+        <TouchableOpacity disabled={loading !== null} onPress={() => void signInWithProvider('apple')} style={[styles.loginSocial, styles.loginApple, loading === 'apple' && styles.buttonDisabled]}><MaterialCommunityIcons name="apple" size={21} color={COLORS.white} style={styles.loginAppleIcon} /><Text style={styles.loginAppleText}>{loading === 'apple' ? 'Abriendo Apple…' : 'Continuar con Apple'}</Text></TouchableOpacity>
+        {message && <Text style={styles.loginMessage}>{message}</Text>}
+      </View>
+      <Text style={styles.loginLegal}>Al continuar, aceptas que guardemos tu perfil y tu armario de forma segura.</Text>
+    </ScrollView>
+  </SafeAreaView>;
+}
+
+const STYLE_OPTIONS = ['Casual', 'Minimalista', 'Clásico', 'Urbano', 'Deportivo', 'Elegante'];
+const STYLE_DESCRIPTIONS: Record<string, string> = { Casual: 'Fácil · relajado', Minimalista: 'Limpio · esencial', Clásico: 'Atemporal · pulido', Urbano: 'Actual · expresivo', Deportivo: 'Activo · funcional', Elegante: 'Refinado · especial' };
+const STYLE_ACCENTS: Record<string, string> = { Casual: '#D98567', Minimalista: '#BFCBB4', Clásico: '#C9B69D', Urbano: '#9699A8', Deportivo: '#9DB6A5', Elegante: '#B7A0A1' };
+const COLOR_OPTIONS = ['Negro', 'Blanco', 'Azul', 'Beige', 'Marrón', 'Verde', 'Rojo', 'Rosa'];
+const COLOR_SWATCHES: Record<string, string> = { Negro: '#252422', Blanco: '#F4F1EA', Azul: '#758DA5', Beige: '#DCCCB6', Marrón: '#8A6650', Verde: '#809078', Rojo: '#B9655A', Rosa: '#D4A1A2' };
+const BRAND_OPTIONS = [
+  { name: 'Zara', mark: 'ZARA' }, { name: 'UNIQLO', mark: 'UNIQLO' }, { name: 'COS', mark: 'COS' },
+  { name: 'Mango', mark: 'MANGO' }, { name: 'ARKET', mark: 'ARKET' }, { name: 'Massimo Dutti', mark: 'MASSIMO DUTTI' },
+  { name: 'H&M', mark: 'H&M' }, { name: 'Pull&Bear', mark: 'PULL&BEAR' }, { name: 'Bershka', mark: 'BERSHKA' }, { name: 'Stradivarius', mark: 'STRADIVARIUS' },
+  { name: 'Oysho', mark: 'OYSHO' }, { name: 'Lefties', mark: 'LEFTIES' }, { name: 'Primark', mark: 'PRIMARK' }, { name: 'Cortefiel', mark: 'CORTEFIEL' },
+  { name: 'Sandro', mark: 'SANDRO' }, { name: 'Maje', mark: 'MAJE' }, { name: 'Sézane', mark: 'SÉZANE' }, { name: 'Rouje', mark: 'ROUJE' },
+  { name: 'Aritzia', mark: 'ARITZIA' }, { name: 'Reformation', mark: 'REFORMATION' }, { name: 'Everlane', mark: 'EVERLANE' }, { name: 'Abercrombie', mark: 'ABERCROMBIE' },
+  { name: 'Levi’s', mark: 'LEVI’S' }, { name: 'Carhartt WIP', mark: 'CARHARTT WIP' }, { name: 'Dickies', mark: 'DICKIES' }, { name: 'Patagonia', mark: 'PATAGONIA' },
+  { name: 'The North Face', mark: 'THE NORTH FACE' }, { name: 'Nike', mark: 'NIKE' }, { name: 'Adidas', mark: 'ADIDAS' }, { name: 'New Balance', mark: 'NEW BALANCE' },
+  { name: 'Puma', mark: 'PUMA' }, { name: 'Asics', mark: 'ASICS' }, { name: 'Veja', mark: 'VEJA' }, { name: 'On', mark: 'ON' },
+  { name: 'Dr. Martens', mark: 'DR. MARTENS' }, { name: 'Birkenstock', mark: 'BIRKENSTOCK' }, { name: 'Vans', mark: 'VANS' }, { name: 'Converse', mark: 'CONVERSE' },
+  { name: 'Lacoste', mark: 'LACOSTE' }, { name: 'Ralph Lauren', mark: 'RALPH LAUREN' }, { name: 'Tommy Hilfiger', mark: 'TOMMY HILFIGER' }, { name: 'Calvin Klein', mark: 'CALVIN KLEIN' },
+  { name: 'Gant', mark: 'GANT' }, { name: 'Polo Ralph Lauren', mark: 'POLO' }, { name: 'A.P.C.', mark: 'A.P.C.' }, { name: 'Acne Studios', mark: 'ACNE STUDIOS' },
+  { name: 'Totême', mark: 'TOTÊME' }, { name: 'Ganni', mark: 'GANNI' }, { name: 'Lululemon', mark: 'LULULEMON' }, { name: 'Uniqlo U', mark: 'UNIQLO U' },
+  { name: '& Other Stories', mark: '& OTHER STORIES' }, { name: 'Weekday', mark: 'WEEKDAY' }, { name: 'Monki', mark: 'MONKI' }, { name: 'NA-KD', mark: 'NA-KD' },
+  { name: 'Adolfo Domínguez', mark: 'ADOLFO DOMÍNGUEZ' }, { name: 'Bimba y Lola', mark: 'BIMBA Y LOLA' }, { name: 'Desigual', mark: 'DESIGUAL' }, { name: 'Pedro del Hierro', mark: 'PEDRO DEL HIERRO' },
+  { name: 'El Ganso', mark: 'EL GANSO' }, { name: 'Scalpers', mark: 'SCALPERS' }, { name: 'Loewe', mark: 'LOEWE' }, { name: 'Miu Miu', mark: 'MIU MIU' },
+  { name: 'Gucci', mark: 'GUCCI' }, { name: 'Prada', mark: 'PRADA' }, { name: 'Valentino', mark: 'VALENTINO' }, { name: 'Saint Laurent', mark: 'SAINT LAURENT' },
+  { name: 'Burberry', mark: 'BURBERRY' }, { name: 'Balenciaga', mark: 'BALENCIAGA' }, { name: 'Bottega Veneta', mark: 'BOTTEGA VENETA' }, { name: 'Jacquemus', mark: 'JACQUEMUS' },
+  { name: 'Maison Margiela', mark: 'MAISON MARGIELA' }, { name: 'Isabel Marant', mark: 'ISABEL MARANT' }, { name: 'Marni', mark: 'MARNI' }, { name: 'Etro', mark: 'ETRO' },
+  { name: 'Hugo Boss', mark: 'HUGO BOSS' }, { name: 'Armani Exchange', mark: 'A|X' }, { name: 'Diesel', mark: 'DIESEL' }, { name: 'Guess', mark: 'GUESS' },
+  { name: 'Superdry', mark: 'SUPERDRY' }, { name: 'AllSaints', mark: 'ALLSAINTS' }, { name: 'Lacoste Sport', mark: 'LACOSTE SPORT' }, { name: 'Fred Perry', mark: 'FRED PERRY' },
+  { name: 'Champion', mark: 'CHAMPION' }, { name: 'Reebok', mark: 'REEBOK' }, { name: 'Under Armour', mark: 'UNDER ARMOUR' }, { name: 'Salomon', mark: 'SALOMON' },
+  { name: 'Hoka', mark: 'HOKA' }, { name: 'New Era', mark: 'NEW ERA' }, { name: 'Stüssy', mark: 'STÜSSY' }, { name: 'Supreme', mark: 'SUPREME' },
+  { name: 'Essentials', mark: 'ESSENTIALS' }, { name: 'Fear of God', mark: 'FEAR OF GOD' }, { name: 'Stone Island', mark: 'STONE ISLAND' }, { name: 'Lemaire', mark: 'LEMAIRE' },
+  { name: 'Massimo Alba', mark: 'MASSIMO ALBA' }, { name: 'Sézane Paris', mark: 'SÉZANE PARIS' }, { name: 'Camaïeu', mark: 'CAMAÏEU' }, { name: 'Kiabi', mark: 'KIABI' },
+  { name: 'Springfield', mark: 'SPRINGFIELD' }, { name: 'Women’secret', mark: 'WOMEN’SECRET' }, { name: 'Intimissimi', mark: 'INTIMISSIMI' }, { name: 'Calzedonia', mark: 'CALZEDONIA' },
+  { name: 'Kiko Milano', mark: 'KIKO MILANO' }, { name: 'Urban Outfitters', mark: 'URBAN OUTFITTERS' }, { name: 'Anthropologie', mark: 'ANTHROPOLOGIE' }, { name: 'Free People', mark: 'FREE PEOPLE' },
+  { name: 'Net-a-Porter', mark: 'NET-A-PORTER' }, { name: 'Farfetch', mark: 'FARFETCH' }, { name: 'Mytheresa', mark: 'MYTHERESA' }, { name: 'Vinted', mark: 'VINTED' },
+];
+const GENDER_OPTIONS = ['Mujer', 'Hombre', 'No binario', 'Prefiero no indicarlo'];
+
+function OnboardingScreen({ onComplete, initialName, initialGender, initialStyles, initialColors, initialShops }: { onComplete: () => void; initialName?: string; initialGender?: string; initialStyles?: string[]; initialColors?: string[]; initialShops?: string[] }) {
+  const [name, setName] = useState(initialName || '');
+  const [gender, setGender] = useState(initialGender || '');
+  const [stylePreferences, setStylePreferences] = useState<string[]>(initialStyles || []);
+  const [colors, setColors] = useState<string[]>(initialColors || []);
+  const [shops, setShops] = useState((initialShops || []).filter((shop) => BRAND_OPTIONS.some((brand) => brand.name === shop)).join(', '));
+  const [otherBrand, setOtherBrand] = useState((initialShops || []).filter((shop) => !BRAND_OPTIONS.some((brand) => brand.name === shop)).join(', '));
+  const [brandQuery, setBrandQuery] = useState('');
+  const [step, setStep] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const visibleBrands = BRAND_OPTIONS.filter(({ name }) => name.toLocaleLowerCase().includes(brandQuery.trim().toLocaleLowerCase()));
+  const toggle = (value: string, setter: Dispatch<SetStateAction<string[]>>) => setter((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value]);
+
+  const saveProfile = async () => {
+    if (!name.trim() || !gender) {
+      setMessage('Indica cómo quieres que te llamemos y selecciona una opción de género.');
+      return;
+    }
+    setSaving(true);
+    setMessage(null);
+    const favoriteShops = [...shops.split(',').map((shop) => shop.trim()).filter(Boolean), otherBrand.trim()].filter(Boolean);
+    const { error } = await supabase.auth.updateUser({ data: {
+      display_name: name.trim(),
+      gender_identity: gender,
+      style_preferences: stylePreferences,
+      color_preferences: colors,
+      favorite_shops: favoriteShops,
+      onboarding_completed: true,
+      onboarding_completed_at: new Date().toISOString(),
+    } });
+    setSaving(false);
+    if (error) {
+      console.error('[Supabase] Error guardando el perfil inicial:', error);
+      setMessage(error.message);
+      return;
+    }
+    onComplete();
+  };
+
+  const continueOnboarding = () => {
+    if (step < 3) {
+      if (step === 0 && (!name.trim() || !gender)) {
+        setMessage('Completa tu nombre y selecciona una opción de género.');
+        return;
+      }
+      setMessage(null);
+      setStep((current) => current + 1);
+      return;
+    }
+    void saveProfile();
+  };
+
+  return <SafeAreaView style={styles.safe}>
+    <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} />
+    <ScrollView contentContainerStyle={styles.onboardingScroll} keyboardShouldPersistTaps="handled">
+      <View style={styles.onboardingTop}><TouchableOpacity disabled={step === 0} onPress={() => setStep((current) => Math.max(0, current - 1))} style={styles.onboardingBack}>{step > 0 && <><Feather name="arrow-left" size={17} color={COLORS.ink} /><Text style={styles.onboardingBackText}>Atrás</Text></>}</TouchableOpacity><Text style={styles.onboardingCounter}>{step + 1} / 4</Text></View>
+      <View style={styles.onboardingDots}>{[0, 1, 2, 3].map((dot) => <View key={dot} style={[styles.onboardingDot, dot === step && styles.onboardingDotActive, dot < step && styles.onboardingDotComplete]} />)}</View>
+      <View style={styles.onboardingHero}><View style={styles.onboardingStepIcon}><Feather name={step === 0 ? 'user' : step === 1 ? 'star' : step === 2 ? 'sliders' : 'tag'} size={22} color={COLORS.white} /></View><Text style={styles.loginEyebrow}>{step === 0 ? 'EMPECEMOS' : step === 1 ? 'TU ESTILO' : step === 2 ? 'TU PALETA' : 'TUS MARCAS'}</Text><Text style={styles.onboardingTitle}>{step === 0 ? 'Tu armario empieza aquí.' : step === 1 ? '¿Cómo te gusta vestir?' : step === 2 ? 'Dale color a tu armario.' : '¿Qué marcas te inspiran?'}</Text><Text style={styles.onboardingSubtitle}>{step === 0 ? 'Un par de detalles y empezamos a construir tu espacio personal.' : step === 1 ? 'Elige las opciones que más se parezcan a ti.' : step === 2 ? 'Así podremos crear recomendaciones más personales.' : 'Elige tus referencias para descubrir prendas que encajen contigo.'}</Text></View>
+      <View style={styles.onboardingCard}>
+        {step === 0 && <><View style={styles.onboardingCardHeader}><View><Text style={styles.onboardingCardEyebrow}>PERFIL PERSONAL</Text><Text style={styles.onboardingCardIntro}>Cuéntanos un poco sobre ti</Text></View><Feather name="edit-3" size={18} color={COLORS.sageDark} /></View><Text style={styles.onboardingFieldLabel}>NOMBRE</Text><TextInput value={name} onChangeText={setName} autoCapitalize="words" placeholder="Tu nombre" placeholderTextColor="#9B958E" style={styles.loginStandaloneInput} /><Text style={styles.onboardingSectionTitle}>Género</Text><Text style={styles.onboardingHint}>Lo usaremos para adaptar la experiencia a ti.</Text><View style={styles.genderGrid}>{GENDER_OPTIONS.map((option) => { const selected = gender === option; return <TouchableOpacity key={option} onPress={() => setGender(option)} style={[styles.genderCard, selected && styles.genderCardActive]}><Text style={[styles.genderCardText, selected && styles.genderCardTextActive]}>{option}</Text>{selected && <Feather name="check" size={14} color={COLORS.white} />}</TouchableOpacity>; })}</View></>}
+        {step === 1 && <><Text style={styles.onboardingSectionTitle}>Tu estilo</Text><Text style={styles.onboardingHint}>Puedes elegir varias opciones.</Text><View style={styles.styleGrid}>{STYLE_OPTIONS.map((option) => { const selected = stylePreferences.includes(option); return <TouchableOpacity key={option} onPress={() => toggle(option, setStylePreferences)} style={[styles.styleCard, selected && styles.styleCardActive]}><View style={[styles.styleCardAccent, { backgroundColor: STYLE_ACCENTS[option] }]} /><View style={styles.styleCardCopy}><Text style={[styles.styleCardTitle, selected && styles.styleCardTitleActive]}>{option}</Text><Text style={[styles.styleCardDescription, selected && styles.styleCardDescriptionActive]}>{STYLE_DESCRIPTIONS[option]}</Text></View><View style={[styles.styleCardCheck, selected && styles.styleCardCheckActive]}>{selected && <Feather name="check" size={12} color={COLORS.white} />}</View></TouchableOpacity>; })}</View></>}
+        {step === 2 && <><Text style={styles.onboardingSectionTitle}>Colores que más usas</Text><Text style={styles.onboardingHint}>Construiremos tu paleta a partir de estos tonos.</Text><View style={styles.colorGrid}>{COLOR_OPTIONS.map((option) => { const selected = colors.includes(option); return <TouchableOpacity key={option} onPress={() => toggle(option, setColors)} style={[styles.colorCard, selected && styles.colorCardActive]}><View style={[styles.colorSwatch, { backgroundColor: COLOR_SWATCHES[option] }, option === 'Blanco' && styles.colorSwatchLight]}>{selected && <Feather name="check" size={13} color={option === 'Blanco' ? COLORS.ink : COLORS.white} />}</View><Text style={[styles.colorCardText, selected && styles.colorCardTextActive]}>{option}</Text></TouchableOpacity>; })}</View></>}
+        {step === 3 && <><Text style={styles.onboardingSectionTitle}>Marcas que te inspiran</Text><Text style={styles.onboardingHint}>Busca entre nuestras marcas y elige todas las que quieras.</Text><View style={styles.brandSearchWrap}><Feather name="search" size={17} color={COLORS.muted} /><TextInput value={brandQuery} onChangeText={setBrandQuery} placeholder="Buscar marca" placeholderTextColor="#9B958E" style={styles.brandSearch} autoCapitalize="none" autoCorrect={false} /></View>{visibleBrands.length > 0 ? <View style={styles.brandGrid}>{visibleBrands.map(({ name, mark }) => { const selected = shops.split(',').map((shop) => shop.trim()).includes(name); return <TouchableOpacity key={name} onPress={() => setShops((current) => { const values = current.split(',').map((shop) => shop.trim()).filter(Boolean); return (selected ? values.filter((shop) => shop !== name) : [...values, name]).join(', '); })} style={[styles.brandCard, selected && styles.brandCardActive]}><View style={styles.brandLogo}><Text numberOfLines={1} adjustsFontSizeToFit style={[styles.brandLogoText, selected && styles.brandLogoTextActive]}>{mark}</Text></View><Text style={[styles.brandFallback, selected && styles.brandFallbackActive]}>{name}</Text>{selected && <View style={styles.brandCheck}><Feather name="check" size={11} color={COLORS.white} /></View>}</TouchableOpacity>; })}</View> : <Text style={styles.brandEmpty}>No hemos encontrado esa marca. Puedes añadirla abajo.</Text>}<View style={styles.onboardingSectionRow}><Text style={styles.onboardingSectionTitle}>Otra marca</Text><Text style={styles.onboardingOptional}>OPCIONAL</Text></View><TextInput value={otherBrand} onChangeText={setOtherBrand} placeholder="Escribe una marca…" placeholderTextColor="#9B958E" style={styles.loginStandaloneInput} /></>}
+        {message && <Text style={styles.loginMessage}>{message}</Text>}
+      </View>
+    </ScrollView>
+        <TouchableOpacity disabled={saving} onPress={continueOnboarding} style={[styles.onboardingFloatingButton, saving && styles.buttonDisabled]} accessibilityRole="button" accessibilityLabel={step < 3 ? 'Continuar' : 'Entrar en mi armario'}><Feather name={step < 3 ? 'arrow-right' : 'check'} size={24} color={COLORS.white} /></TouchableOpacity>
+  </SafeAreaView>;
+}
+
+function Profile({ onBack, email, displayName, onSignOut, onEditSetup }: { onBack: () => void; email?: string; displayName?: string; onSignOut: () => void; onEditSetup: () => void }) {
   return <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
     <View style={{ height: 18 }} />
     <TouchableOpacity style={styles.backButton} onPress={onBack}><Feather name="arrow-left" size={19} color={COLORS.ink} /><Text style={styles.backButtonText}>Volver</Text></TouchableOpacity>
-    <View style={{ marginTop: 12, marginBottom: 30 }}><Text style={styles.eyebrow}>MI PERFIL</Text><Text style={styles.title}>Kevin M.B.</Text><Text style={styles.addIntro}>Tus preferencias y datos de estilo.</Text></View>
-    <View style={styles.homeWardrobeEmpty}><View style={styles.homeWardrobeEmptyIcon}><Feather name="sliders" size={21} color={COLORS.sageDark} /></View><View style={styles.homeWardrobeEmptyCopy}><Text style={styles.homeWardrobeEmptyTitle}>Configuración inicial</Text><Text style={styles.homeWardrobeEmptyText}>Aquí podrás definir tus preferencias de estilo, tallas y comercios.</Text></View></View>
+    <View style={{ marginTop: 12, marginBottom: 30 }}><Text style={styles.eyebrow}>MI PERFIL</Text><Text style={styles.title}>{displayName || email?.split('@')[0] || 'Mi cuenta'}</Text><Text style={styles.addIntro}>{email || 'Tus preferencias y datos de estilo.'}</Text></View>
+    <TouchableOpacity onPress={onEditSetup} style={styles.homeWardrobeEmpty} accessibilityRole="button" accessibilityLabel="Abrir configuración inicial"><View style={styles.homeWardrobeEmptyIcon}><Feather name="sliders" size={21} color={COLORS.sageDark} /></View><View style={styles.homeWardrobeEmptyCopy}><Text style={styles.homeWardrobeEmptyTitle}>Configuración inicial</Text><Text style={styles.homeWardrobeEmptyText}>Actualiza tu nombre, género, estilo, colores y marcas favoritas.</Text></View><Feather name="chevron-right" size={18} color={COLORS.muted} /></TouchableOpacity>
+    <TouchableOpacity onPress={onSignOut} style={styles.signOutButton}><Feather name="log-out" size={17} color="#A54E43" /><Text style={styles.signOutButtonText}>Cerrar sesión</Text></TouchableOpacity>
   </ScrollView>;
 }
 
@@ -1013,9 +1273,86 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('inicio');
   const [captureFromCamera, setCaptureFromCamera] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [onboardingCompleted, setOnboardingCompleted] = useState(false);
   const [savedGarments, setSavedGarments] = useState<SavedGarment[]>([]);
   const [savedOutfits, setSavedOutfits] = useState<SavedOutfit[]>([]);
   const [wardrobeInitialCategory, setWardrobeInitialCategory] = useState('todas');
+  useEffect(() => {
+    const configuredUrl = process.env.EXPO_PUBLIC_SUPABASE_URL;
+    console.log('[Supabase] Inicializando conexión…', {
+      url: configuredUrl || '(no configurada)',
+      anonKeyConfigured: Boolean(process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY),
+    });
+
+    let mounted = true;
+    void supabase.auth.getSession()
+      .then(({ data, error }) => {
+        if (!mounted) return;
+        if (error) {
+          setAuthLoading(false);
+          console.warn('[Supabase] Error recuperando la sesión:', {
+            name: error.name,
+            message: error.message,
+            status: error.status,
+          });
+          return;
+        }
+        if (!data.session) {
+          setSession(null);
+          setOnboardingCompleted(false);
+          setAuthLoading(false);
+          console.log('[Supabase] Conexión correcta. Sesión: sin sesión');
+          return;
+        }
+        console.log('[Supabase] Sesión local encontrada. Validando usuario en servidor…');
+        void supabase.auth.getUser(data.session.access_token)
+          .then(async ({ data: userData, error: userError }) => {
+            if (!mounted) return;
+            if (userError || !userData.user) {
+              console.warn('[Supabase] La cuenta local ya no es válida. Limpiando sesión:', userError?.message || 'usuario no encontrado');
+              await supabase.auth.signOut({ scope: 'local' });
+              if (!mounted) return;
+              setSession(null);
+              setOnboardingCompleted(false);
+              setAuthLoading(false);
+              return;
+            }
+            setSession(data.session);
+            setOnboardingCompleted(userData.user.user_metadata?.onboarding_completed === true);
+            setAuthLoading(false);
+            console.log('[Supabase] Conexión y sesión válidas. Usuario:', userData.user.id);
+          })
+          .catch(async (validationError) => {
+            if (!mounted) return;
+            console.error('[Supabase] Fallo validando la sesión local:', validationError?.message || validationError);
+            await supabase.auth.signOut({ scope: 'local' });
+            if (!mounted) return;
+            setSession(null);
+            setOnboardingCompleted(false);
+            setAuthLoading(false);
+          });
+      })
+      .catch((error) => {
+        if (!mounted) return;
+        setAuthLoading(false);
+        console.error('[Supabase] Fallo de red al recuperar la sesión:', error?.message || error);
+      });
+
+    const { data: authSubscription } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'INITIAL_SESSION') return;
+      setSession(session);
+      setOnboardingCompleted(session?.user.user_metadata?.onboarding_completed === true);
+      setAuthLoading(false);
+      console.log('[Supabase] Cambio de autenticación:', event, session ? 'sesión activa' : 'sin sesión');
+    });
+
+    return () => {
+      mounted = false;
+      authSubscription.subscription.unsubscribe();
+    };
+  }, []);
   const saveToWardrobe = (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => {
     const addedUses = wornItemIds.reduce<Record<string, number>>((counts, id) => ({ ...counts, [id]: (counts[id] || 0) + 1 }), {});
     const updatesById = new Map(updatedItems.map((item) => [item.id, item]));
@@ -1057,9 +1394,20 @@ export default function App() {
   };
   const deleteOutfit = (id: string) => setSavedOutfits((current) => current.filter((outfit) => outfit.id !== id));
   const restoreOutfit = (outfit: SavedOutfit) => setSavedOutfits((current) => current.some((item) => item.id === outfit.id) ? current : [outfit, ...current]);
+  const signOut = async () => {
+    const { error } = await supabase.auth.signOut();
+    if (error) setNotice({ title: 'No hemos podido cerrar sesión', message: error.message });
+  };
+  const reopenOnboarding = () => {
+    setTab('inicio');
+    setOnboardingCompleted(false);
+  };
+  if (authLoading) return <SafeAreaView style={styles.safe}><StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} /><View style={styles.authLoading}><ActivityIndicator color={COLORS.sageDark} /><Text style={styles.authLoadingText}>Conectando con tu armario…</Text></View></SafeAreaView>;
+  if (!session) return <LoginScreen />;
+  if (!onboardingCompleted) return <OnboardingScreen initialName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || ''} initialGender={session.user.user_metadata?.gender_identity} initialStyles={session.user.user_metadata?.style_preferences} initialColors={session.user.user_metadata?.color_preferences} initialShops={session.user.user_metadata?.favorite_shops} onComplete={() => setOnboardingCompleted(true)} />;
   return <NoticeContext.Provider value={{ showNotice: setNotice }}><SafeAreaView style={styles.safe}>
     <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} />
-    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} onOutfitSave={(outfit) => setSavedOutfits((current) => [outfit, ...current])} wardrobeItems={savedGarments} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} /> : <EmptyScreen tab={tab} />}</View>
+    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} onOutfitSave={(outfit) => setSavedOutfits((current) => [outfit, ...current])} wardrobeItems={savedGarments} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} /> : <EmptyScreen tab={tab} />}</View>
     {tab !== 'perfil' && <View style={styles.nav}>
       {nav.map((item) => {
         const active = tab === item.key;
@@ -1076,8 +1424,17 @@ export default function App() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: COLORS.paper, paddingTop: Platform.OS === 'android' ? 14 : 0 }, app: { flex: 1 }, scroll: { padding: 20, paddingBottom: 34 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8, marginBottom: 24 },
-  eyebrow: { fontSize: 10, letterSpacing: 1.5, color: COLORS.muted, fontWeight: '700', marginBottom: 5 },
+  authLoading: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 14 }, authLoadingText: { color: COLORS.muted, fontSize: 13, fontWeight: '600' },
+  loginScroll: { flexGrow: 1, justifyContent: 'center', padding: 24, paddingVertical: 36 }, loginHero: { alignItems: 'center', marginBottom: 24 }, loginIcon: { width: 68, height: 68, borderRadius: 22, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', marginBottom: 20 }, loginEyebrow: { color: COLORS.sageDark, fontSize: 10, letterSpacing: 1.7, fontWeight: '800', marginBottom: 9 }, loginTitle: { color: COLORS.ink, fontSize: 29, lineHeight: 35, fontWeight: '800', letterSpacing: -0.8, textAlign: 'center' }, loginSubtitle: { color: COLORS.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', marginTop: 12, maxWidth: 315 }, loginCard: { backgroundColor: COLORS.white, borderRadius: 26, padding: 20, borderWidth: 1, borderColor: COLORS.line, shadowColor: COLORS.ink, shadowOpacity: 0.055, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 2 }, loginCardEyebrow: { color: COLORS.sageDark, fontSize: 9, letterSpacing: 1.45, fontWeight: '900', marginBottom: 7 }, loginCardTitle: { color: COLORS.ink, fontSize: 21, lineHeight: 26, fontWeight: '800', letterSpacing: -0.45 }, loginCardDescription: { color: COLORS.muted, fontSize: 12, lineHeight: 18, marginTop: 5, marginBottom: 18 }, loginFieldGroup: { marginBottom: 12 }, loginPasswordLabelRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 7 }, loginFieldLabel: { color: COLORS.ink, fontSize: 11, fontWeight: '800', marginBottom: 7 }, loginForgot: { color: COLORS.sageDark, fontSize: 10, fontWeight: '800' }, loginInputWrap: { height: 52, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 10 }, loginInputWrapFocused: { borderColor: COLORS.sageDark, backgroundColor: '#F7FAF4', shadowColor: COLORS.sageDark, shadowOpacity: 0.12, shadowRadius: 7, shadowOffset: { width: 0, height: 2 }, elevation: 1 }, loginInput: { flex: 1, height: '100%', color: COLORS.ink, fontSize: 14 }, loginStandaloneInput: { height: 50, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', paddingHorizontal: 14, color: COLORS.ink, fontSize: 14, marginBottom: 10 }, loginPrimary: { height: 53, borderRadius: 16, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', marginTop: 5, shadowColor: COLORS.sageDark, shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, loginPrimaryText: { color: COLORS.white, fontSize: 14, fontWeight: '800' }, loginSwitch: { alignSelf: 'center', flexDirection: 'row', paddingVertical: 16 }, loginSwitchPrompt: { color: COLORS.muted, fontSize: 12, fontWeight: '600' }, loginSwitchText: { color: COLORS.sageDark, fontSize: 12, fontWeight: '800' }, loginDivider: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 15 }, loginDividerLine: { flex: 1, height: 1, backgroundColor: COLORS.line }, loginDividerText: { color: COLORS.muted, fontSize: 10, fontWeight: '700' }, loginSocial: { height: 52, borderRadius: 15, borderWidth: 1, borderColor: '#D6D1CA', backgroundColor: COLORS.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 10, position: 'relative' }, loginSocialText: { color: COLORS.ink, fontSize: 13, fontWeight: '800' }, loginGoogleMark: { position: 'absolute', left: 17, color: '#4285F4', fontSize: 18, fontWeight: '900' }, loginApple: { backgroundColor: COLORS.ink, borderColor: COLORS.ink }, loginAppleMark: { position: 'absolute', left: 18, color: COLORS.white, fontSize: 18 }, loginAppleText: { color: COLORS.white, fontSize: 13, fontWeight: '800' }, loginMessage: { color: '#A54E43', fontSize: 11, lineHeight: 16, textAlign: 'center', marginTop: 6 }, signOutButton: { alignSelf: 'flex-start', marginTop: 18, minHeight: 46, borderRadius: 14, borderWidth: 1, borderColor: '#DFC4BF', backgroundColor: '#FCF4F2', paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', gap: 8 }, signOutButtonText: { color: '#A54E43', fontSize: 12, fontWeight: '800' },
+  loginLookbook: { width: 170, height: 116, borderRadius: 29, backgroundColor: '#E7DED3', marginBottom: 22, overflow: 'hidden', alignItems: 'center', justifyContent: 'center' }, loginLookbookCircle: { position: 'absolute', width: 123, height: 123, borderRadius: 62, backgroundColor: '#C8D1BD', top: -55, right: -19 }, loginLookbookSquare: { position: 'absolute', width: 86, height: 86, borderRadius: 24, backgroundColor: '#D98567', bottom: -43, left: -22, transform: [{ rotate: '24deg' }] }, loginLookbookLabel: { position: 'absolute', right: 10, bottom: 10, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.82)', paddingHorizontal: 8, paddingVertical: 5 }, loginLookbookLabelText: { color: COLORS.ink, fontSize: 7, fontWeight: '900', letterSpacing: 1 }, loginBenefits: { flexDirection: 'row', alignItems: 'center', marginTop: 16 }, loginBenefit: { flexDirection: 'row', alignItems: 'center', gap: 6 }, loginBenefitText: { color: COLORS.sageDark, fontSize: 10, fontWeight: '800' }, loginBenefitDot: { width: 3, height: 3, borderRadius: 2, backgroundColor: '#AAA39C', marginHorizontal: 10 }, loginLegal: { color: '#9B958E', fontSize: 9, lineHeight: 14, textAlign: 'center', marginTop: 15, paddingHorizontal: 20 },
+  loginWordmark: { alignSelf: 'stretch', flexDirection: 'row', alignItems: 'center', marginBottom: 20 }, loginWordmarkDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: COLORS.clay, marginRight: 7 }, loginWordmarkText: { color: COLORS.ink, fontSize: 12, letterSpacing: 2.6, fontWeight: '900' }, loginWordmarkSub: { color: COLORS.muted, fontSize: 8, letterSpacing: 1.4, fontWeight: '800', marginLeft: 8 }, loginWelcome: { alignSelf: 'stretch', minHeight: 138, borderRadius: 24, overflow: 'hidden', backgroundColor: '#E9E3D8', padding: 20, flexDirection: 'row' }, loginWelcomeCopy: { flex: 1, zIndex: 2, paddingRight: 12 }, loginWelcomeKicker: { color: COLORS.sageDark, fontSize: 8, fontWeight: '900', letterSpacing: 1.25, marginBottom: 10 }, loginWelcomeTitle: { color: COLORS.ink, fontSize: 24, lineHeight: 27, letterSpacing: -0.75, fontWeight: '800' }, loginWelcomeText: { color: '#625D57', fontSize: 10, lineHeight: 15, marginTop: 8, maxWidth: 185 }, loginWelcomeArtwork: { width: 112, position: 'absolute', right: 0, top: 0, bottom: 0, overflow: 'hidden' }, loginWelcomeArch: { position: 'absolute', width: 142, height: 142, borderRadius: 71, backgroundColor: COLORS.sage, top: 32, right: -32 }, loginWelcomeTile: { position: 'absolute', width: 76, height: 126, borderTopLeftRadius: 38, backgroundColor: COLORS.clay, top: -28, right: 3, transform: [{ rotate: '18deg' }] }, loginWelcomeIcon: { position: 'absolute', width: 46, height: 46, borderRadius: 23, backgroundColor: '#FFFCF7', right: 24, bottom: 20, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.ink, shadowOpacity: 0.1, shadowRadius: 8, shadowOffset: { width: 0, height: 3 }, elevation: 2 }, loginGoogleIcon: { position: 'absolute', left: 16 }, loginAppleIcon: { position: 'absolute', left: 16 },
+  onboardingScroll: { flexGrow: 1, padding: 20, paddingBottom: 116 }, onboardingTop: { minHeight: 28, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, onboardingBack: { minWidth: 60, minHeight: 28, flexDirection: 'row', alignItems: 'center', gap: 5 }, onboardingBackText: { color: COLORS.ink, fontSize: 11, fontWeight: '700' }, onboardingCounter: { color: COLORS.muted, fontSize: 11, fontWeight: '800', letterSpacing: 1 }, onboardingProgress: { height: 4, borderRadius: 2, backgroundColor: COLORS.line, overflow: 'hidden', marginTop: 10 }, onboardingProgressFill: { height: '100%', borderRadius: 2, backgroundColor: COLORS.clay }, onboardingHero: { alignItems: 'center', paddingTop: 25, marginBottom: 21 }, onboardingStepIcon: { width: 50, height: 50, borderRadius: 18, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', marginBottom: 17 }, onboardingTitle: { color: COLORS.ink, fontSize: 26, lineHeight: 32, fontWeight: '800', letterSpacing: -0.6, textAlign: 'center' }, onboardingSubtitle: { color: COLORS.muted, fontSize: 12, lineHeight: 19, textAlign: 'center', marginTop: 9, maxWidth: 330 }, onboardingCard: { backgroundColor: COLORS.white, borderRadius: 23, padding: 17, borderWidth: 1, borderColor: COLORS.line }, onboardingFloatingButton: { position: 'absolute', right: 24, bottom: 24, width: 60, height: 60, borderRadius: 30, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.ink, shadowOpacity: 0.2, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 6 }, onboardingSectionTitle: { color: COLORS.ink, fontSize: 14, fontWeight: '800', marginTop: 11, marginBottom: 8 }, onboardingHint: { color: COLORS.muted, fontSize: 10, marginTop: -4, marginBottom: 10 }, onboardingOptional: { color: COLORS.muted, fontSize: 10, fontWeight: '600' }, onboardingChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 4 }, onboardingChip: { minHeight: 35, borderRadius: 18, paddingHorizontal: 12, backgroundColor: '#FBFAF8', borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' }, onboardingChipActive: { backgroundColor: COLORS.sageDark, borderColor: COLORS.sageDark }, onboardingChipText: { color: COLORS.ink, fontSize: 11, fontWeight: '700' }, onboardingChipTextActive: { color: COLORS.white }, onboardingSizeRow: { flexDirection: 'row', gap: 8 }, onboardingSizeInput: { flex: 1 },
+  styleGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 5 }, styleCard: { width: '48%', minHeight: 92, borderRadius: 16, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', padding: 12, justifyContent: 'space-between', overflow: 'hidden' }, styleCardActive: { borderColor: COLORS.sageDark, backgroundColor: '#EEF2EA' }, styleCardAccent: { width: 30, height: 5, borderRadius: 3, marginBottom: 13 }, styleCardCopy: { flex: 1 }, styleCardTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '800' }, styleCardTitleActive: { color: COLORS.sageDark }, styleCardDescription: { color: COLORS.muted, fontSize: 9, marginTop: 4 }, styleCardDescriptionActive: { color: COLORS.sageDark }, styleCardCheck: { position: 'absolute', right: 10, top: 10, width: 20, height: 20, borderRadius: 10, borderWidth: 1, borderColor: '#D8D2C9', alignItems: 'center', justifyContent: 'center' }, styleCardCheckActive: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark },
+  colorGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginBottom: 18 }, colorCard: { width: '22.5%', minHeight: 65, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', alignItems: 'center', justifyContent: 'center', gap: 6 }, colorCardActive: { borderColor: COLORS.sageDark, backgroundColor: '#EEF2EA' }, colorSwatch: { width: 25, height: 25, borderRadius: 13, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(32,29,26,0.08)' }, colorSwatchLight: { borderColor: '#D8D2C9' }, colorCardText: { color: COLORS.ink, fontSize: 9, fontWeight: '700' }, colorCardTextActive: { color: COLORS.sageDark }, onboardingSectionRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 0 }, shopChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 7, marginBottom: 9 }, shopChip: { minHeight: 31, borderRadius: 16, paddingHorizontal: 11, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', justifyContent: 'center' }, shopChipActive: { borderColor: COLORS.clay, backgroundColor: '#F2E2DA' }, shopChipText: { color: COLORS.ink, fontSize: 10, fontWeight: '700' }, shopChipTextActive: { color: '#9E5543' },
+  brandGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 8 }, brandCard: { width: '48%', height: 82, borderRadius: 16, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', alignItems: 'center', justifyContent: 'center', position: 'relative' }, brandCardActive: { borderColor: COLORS.sageDark, backgroundColor: '#EEF2EA' }, brandLogo: { width: 110, height: 30, marginBottom: 4, alignItems: 'center', justifyContent: 'center' }, brandLogoText: { color: COLORS.ink, fontSize: 15, fontWeight: '900', letterSpacing: 1.4, textAlign: 'center' }, brandLogoTextActive: { color: COLORS.sageDark }, brandFallback: { color: COLORS.muted, fontSize: 8, fontWeight: '700', letterSpacing: 1 }, brandFallbackActive: { color: COLORS.sageDark }, brandCheck: { position: 'absolute', right: 9, top: 9, width: 19, height: 19, borderRadius: 10, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center' },
+  onboardingCardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }, onboardingCardEyebrow: { color: COLORS.sageDark, fontSize: 9, letterSpacing: 1.3, fontWeight: '900', marginBottom: 5 }, onboardingCardIntro: { color: COLORS.ink, fontSize: 17, fontWeight: '800' }, onboardingFieldLabel: { color: COLORS.muted, fontSize: 9, fontWeight: '900', letterSpacing: 1.2, marginBottom: 7 }, genderGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 3 }, genderCard: { width: '48%', minHeight: 47, borderRadius: 13, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', paddingHorizontal: 11, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, genderCardActive: { backgroundColor: COLORS.sageDark, borderColor: COLORS.sageDark }, genderCardText: { color: COLORS.ink, fontSize: 11, fontWeight: '700' }, genderCardTextActive: { color: COLORS.white },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 26, marginBottom: 30 },
+  eyebrow: { fontSize: 10, letterSpacing: 1.5, color: COLORS.muted, fontWeight: '700', marginBottom: 9 },
   title: { fontSize: 31, lineHeight: 36, fontWeight: '700', color: COLORS.ink, letterSpacing: -1 },
   avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.sand, alignItems: 'center', justifyContent: 'center' }, avatarText: { fontSize: 16, fontWeight: '700', color: COLORS.ink },
   captureCard: { minHeight: 180, padding: 23, borderRadius: 26, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'flex-end', overflow: 'hidden' },
@@ -1107,4 +1464,6 @@ const styles = StyleSheet.create({
   detailBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(32,29,26,0.42)' }, garmentDetail: { backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: 28 }, garmentDetailTitle: { color: COLORS.ink, fontSize: 21, fontWeight: '700', marginTop: 5, maxWidth: 280 }, garmentDetailImage: { width: '100%', height: 300, borderRadius: 20, backgroundColor: COLORS.sand }, wearSummary: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#E8EEE3', borderRadius: 17, padding: 15, marginTop: 15 }, wearSummaryIcon: { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginRight: 12 }, wearSummaryCount: { color: COLORS.ink, fontSize: 16, fontWeight: '800' }, wearSummaryText: { color: COLORS.muted, fontSize: 11, marginTop: 3 }, garmentDetailMeta: { color: COLORS.muted, fontSize: 11, lineHeight: 17, marginTop: 14, textTransform: 'capitalize' }, detailActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 18 }, editGarmentButton: { width: '100%', height: 48, borderRadius: 14, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }, editGarmentButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' }, rotateImageButton: { height: 48, borderRadius: 14, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }, mergeButton: { flex: 1, height: 48, borderRadius: 14, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }, mergeButtonText: { color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }, deleteButton: { height: 48, borderRadius: 14, borderWidth: 1, borderColor: '#DFC4BF', backgroundColor: '#FCF4F2', paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }, deleteButtonText: { color: '#A54E43', fontSize: 11, fontWeight: '800' }, mergeSheet: { maxHeight: '78%', backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: 28 }, mergeList: { gap: 9, paddingBottom: 8 }, mergeOption: { minHeight: 76, borderRadius: 16, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, padding: 9, flexDirection: 'row', alignItems: 'center' }, mergeOptionImage: { width: 58, height: 58, borderRadius: 11, backgroundColor: COLORS.sand, marginRight: 11 }, mergeOptionCopy: { flex: 1 }, mergeOptionTitle: { color: COLORS.ink, fontSize: 12, fontWeight: '800' }, mergeOptionMeta: { color: COLORS.muted, fontSize: 9, marginTop: 5, textTransform: 'capitalize' }, noMergeOptions: { color: COLORS.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', paddingVertical: 32 }, editGarmentSheet: { height: '88%', backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: 24 }, saveEditButton: { height: 52, borderRadius: 16, backgroundColor: COLORS.clay, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, marginTop: 12 }, saveEditButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
   outfitEvaluation: { backgroundColor: '#EEF2EA', borderRadius: 19, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: '#DCE5D7' }, outfitEvaluationHead: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 }, evaluationEyebrow: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800', letterSpacing: 1.1, marginBottom: 4 }, evaluationTitle: { color: COLORS.ink, fontSize: 17, fontWeight: '700' }, evaluationScore: { width: 58, height: 58, borderRadius: 29, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginLeft: 10 }, evaluationScoreValue: { color: COLORS.sageDark, fontSize: 21, fontWeight: '800', lineHeight: 23 }, evaluationScoreMax: { color: COLORS.muted, fontSize: 9 }, evaluationSummary: { color: COLORS.ink, fontSize: 12, lineHeight: 18, marginBottom: 5 }, evaluationBlock: { marginTop: 10 }, evaluationBlockTitle: { color: COLORS.ink, fontSize: 12, fontWeight: '800', marginBottom: 6 }, evaluationRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginTop: 5 }, evaluationRowText: { flex: 1, color: COLORS.muted, fontSize: 11, lineHeight: 16 },
   noticeBackdrop: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 26, backgroundColor: 'rgba(32,29,26,0.42)' }, noticeCard: { width: '100%', maxWidth: 360, backgroundColor: COLORS.paper, borderRadius: 24, padding: 22, alignItems: 'center' }, noticeIcon: { width: 52, height: 52, borderRadius: 26, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginBottom: 14 }, noticeTitle: { color: COLORS.ink, fontSize: 19, fontWeight: '800', textAlign: 'center' }, noticeMessage: { color: COLORS.muted, fontSize: 13, lineHeight: 19, textAlign: 'center', marginTop: 9 }, noticeActions: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 9, marginTop: 20, width: '100%' }, noticeAction: { minHeight: 45, borderRadius: 14, borderWidth: 1, borderColor: '#C9D2C3', backgroundColor: COLORS.white, paddingHorizontal: 16, alignItems: 'center', justifyContent: 'center' }, noticeActionPrimary: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark }, noticeActionDestructive: { borderColor: '#D8AAA2', backgroundColor: '#FCF1EF' }, noticeActionText: { color: COLORS.sageDark, fontSize: 12, fontWeight: '800' }, noticeActionTextPrimary: { color: COLORS.white }, noticeActionTextDestructive: { color: '#A54E43' },
+  onboardingDots: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 16, marginTop: 12, marginBottom: 2 }, onboardingDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: COLORS.line }, onboardingDotActive: { width: 10, height: 10, borderRadius: 5, backgroundColor: COLORS.clay }, onboardingDotComplete: { backgroundColor: COLORS.sageDark },
+  brandSearchWrap: { height: 48, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 12 }, brandSearch: { flex: 1, height: '100%', color: COLORS.ink, fontSize: 13 }, brandEmpty: { color: COLORS.muted, fontSize: 11, lineHeight: 17, textAlign: 'center', paddingVertical: 18 },
 });

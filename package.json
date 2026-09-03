@@ -1,6 +1,6 @@
 {
   "name": "armario-virtual",
-  "version": "0.0.0.0.0.1",
+  "version": "0.0.1",
   "main": "index.ts",
   "scripts": {
     "dev": "node scripts/dev.mjs",
@@ -13,12 +13,19 @@
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@supabase/supabase-js": "^2.57.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "expo": "~54.0.0",
+    "expo-auth-session": "~7.0.11",
+    "expo-crypto": "~15.0.9",
+    "expo-dev-client": "~6.0.21",
     "expo-image-manipulator": "~14.0.8",
     "expo-image-picker": "~17.0.11",
+    "expo-linking": "~8.0.12",
     "expo-status-bar": "~3.0.8",
+    "expo-web-browser": "~15.0.11",
     "express": "^5.2.1",
     "multer": "^2.3.0",
     "react": "19.1.0",

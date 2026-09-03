@@ -2,11 +2,24 @@
   "expo": {
     "name": "Armario",
     "slug": "armario-virtual",
-    "version": "0.0.0.0.0.1",
+    "version": "0.0.1",
+    "scheme": "armario-virtual",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "android": { "package": "com.armariovirtual.app" },
-    "ios": { "bundleIdentifier": "com.armariovirtual.app" },
+    "androidStatusBar": {
+      "barStyle": "dark-content",
+      "backgroundColor": "#F7F4EF",
+      "translucent": false
+    },
+    "android": {
+      "package": "com.armariovirtual.app",
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.armariovirtual.app"
+    },
     "plugins": [
       [
         "expo-image-picker",
@@ -15,6 +28,11 @@
           "cameraPermission": false
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "94474f63-777a-4a94-b39c-a8f8a6866a6d"
+      }
+    }
   }
 }
