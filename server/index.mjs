@@ -11,6 +11,28 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+const GEMINI_RETRY_DELAYS_MS = [2500, 6000, 12000];
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const fetchGeminiWithRetry = async ({ url, options, log }) => {
+  let lastNetworkError;
+  for (let attempt = 0; attempt <= GEMINI_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (response.status !== 503 || attempt === GEMINI_RETRY_DELAYS_MS.length) return response;
+      const delay = GEMINI_RETRY_DELAYS_MS[attempt];
+      log(`Gemini está temporalmente saturado (HTTP 503). Reintentaremos en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
+      await response.body?.cancel();
+      await wait(delay);
+    } catch (error) {
+      lastNetworkError = error;
+      if (attempt === GEMINI_RETRY_DELAYS_MS.length) throw error;
+      const delay = GEMINI_RETRY_DELAYS_MS[attempt];
+      log(`No se ha podido contactar con Gemini. Reintentaremos en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
+      await wait(delay);
+    }
+  }
+  throw lastNetworkError || new Error('Gemini no ha respondido tras varios intentos.');
+};
 const normalizedText = (value = '') => value.trim().toLocaleLowerCase('es');
 const isFootwear = (item) => {
   const description = `${normalizedText(item.category)} ${normalizedText(item.subcategory)}`;
@@ -75,10 +97,12 @@ const resolveGlassesRotation = async ({ image, mimeType, item, model, apiKey, lo
   const startedAt = Date.now();
   const waitingLog = setInterval(() => log(`Gemini sigue evaluando la orientación del objeto… ${Math.round((Date.now() - startedAt) / 1000)} s.`), 5000);
   try {
-    const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({
+    const geminiResponse = await fetchGeminiWithRetry({
+      url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      options: {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify({
         contents: [{ role: 'user', parts: [
           { text: `Evalúa exclusivamente las gafas contenidas en la caja normalizada xMin=${box.xMin}, yMin=${box.yMin}, xMax=${box.xMax}, yMax=${box.yMax}. El objeto está vertical y debe quedar horizontal. Ignora por completo la persona, la postura, el fondo y cualquier texto que haya detrás. Escoge 90 o 270 grados en sentido horario según cuál deje las gafas del derecho en una presentación de catálogo: montura superior arriba, parte inferior de las lentes abajo y patillas en orientación natural.` },
           { inlineData: { mimeType, data: image.toString('base64') } },
@@ -93,7 +117,9 @@ const resolveGlassesRotation = async ({ image, mimeType, item, model, apiKey, lo
             required: ['rotation'],
           },
         },
-      }),
+        }),
+      },
+      log,
     });
     const result = await geminiResponse.json();
     if (!geminiResponse.ok) throw new Error(result?.error?.message || 'Error de Gemini al orientar el objeto.');
@@ -153,10 +179,12 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
     const waitingLog = setInterval(() => log(`Gemini sigue comparando las prendas… ${Math.round((Date.now() - geminiStartedAt) / 1000)} s de espera.`), 5000);
     let geminiResponse;
     try {
-      geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-      body: JSON.stringify({
+      geminiResponse = await fetchGeminiWithRetry({
+      url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      options: {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+        body: JSON.stringify({
         contents: [{ role: 'user', parts: [
           { text: 'Compara estas dos fotos recortadas de prendas. Determina si probablemente muestran exactamente la misma prenda física, aunque cambien la pose, iluminación, escala u oclusión. No basta con que sean del mismo tipo y color: busca coincidencias en corte, costuras, estampado, logotipo, textura y detalles distintivos. La primera imagen es la nueva y la segunda ya está en el armario. Indica también en bestImage cuál es mejor como foto principal de armario: candidate si la nueva muestra la prenda con más nitidez, tamaño, integridad y menos oclusiones; saved si la guardada es mejor.' },
           { text: 'IMAGEN NUEVA' },
@@ -180,7 +208,9 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
             required: ['sameGarment', 'confidence', 'reason', 'bestImage'],
           },
         },
-      }),
+        }),
+      },
+      log,
       });
     } finally {
       clearInterval(waitingLog);
@@ -226,13 +256,15 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     }, 5000);
     let geminiResponse;
     try {
-      geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: {
+      geminiResponse = await fetchGeminiWithRetry({
+      url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      options: {
+        method: 'POST',
+        headers: {
         'Content-Type': 'application/json',
         'x-goog-api-key': process.env.GEMINI_API_KEY,
       },
-      body: JSON.stringify({
+        body: JSON.stringify({
         systemInstruction: {
           parts: [{ text: 'Analiza exclusivamente las prendas y accesorios visibles. Responde en español. No identifiques a nadie ni infieras género, edad, etnia u otros rasgos personales. Distingue cuidadosamente a los sujetos protagonistas de las personas incidentales del fondo. Una persona es foregroundSubject solo si está en primer plano o plano medio, ocupa una parte significativa de la imagen y su outfit puede analizarse con claridad. Transeúntes, gente distante, figuras pequeñas, reflejos y personas parcialmente visibles del fondo nunca son foregroundSubject. Si hay varios protagonistas reales, sepáralos por su posición visual de izquierda a derecha. Localiza la cara de cada persona y cada prenda mediante rectángulos ajustados en coordenadas normalizadas de 0 a 1000. Calcula displayRotation mirando exclusivamente el eje y la orientación del objeto dentro de su propio itemBox; ignora por completo la postura, inclinación y orientación de la persona y de la foto completa. Indica si ese objeto recortado debe rotarse 0, 90, 180 o 270 grados en sentido horario para verse en orientación convencional de catálogo: las dos lentes de unas gafas deben quedar una junto a otra en horizontal y la ropa debe quedar erguida. Cuenta siempre un par de calzado como una única prenda, no como dos objetos; su itemBox debe abarcar ambos zapatos o zapatillas. Usa siempre una de estas categorías generales: ropa superior, ropa inferior, prenda de cuerpo entero, abrigo, calzado o accesorio. Distingue entre composición aparente (por ejemplo algodón, lino, poliéster, lana o mezcla) y construcción del tejido (por ejemplo punto, tejido plano, denim o cuero). No afirmes una composición exacta si no es visualmente verificable: usa "no determinable" o "mezcla probable" y una confianza baja. Solo informa de una marca cuando su nombre o logotipo sea claramente visible y reconocible en esa prenda; no la deduzcas por el diseño, el estilo o el contexto. Si no es inequívoca, devuelve una cadena vacía.' }],
         },
@@ -330,7 +362,9 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
             required: ['youngChildDetected', 'people'],
           },
         },
-      }),
+        }),
+      },
+      log,
       });
     } finally {
       clearInterval(waitingLog);
@@ -405,6 +439,11 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     response.json(analysis);
   } catch (error) {
     console.error(`[${new Date().toISOString()}] [${requestId}] Error tras ${Date.now() - startedAt} ms:`, error?.message || error);
+    if (error?.status === 503) {
+      return response.status(503).json({
+        error: 'Gemini está temporalmente saturado. Hemos reintentado el análisis varias veces; prueba de nuevo en un momento.',
+      });
+    }
     if (error?.status === 429) {
       return response.status(429).json({
         error: 'Has alcanzado temporalmente el límite gratuito de Gemini. Espera un poco y vuelve a intentarlo.',
