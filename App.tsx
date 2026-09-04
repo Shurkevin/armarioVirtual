@@ -22,10 +22,12 @@ import {
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
+import { File } from 'expo-file-system';
 import { makeRedirectUri } from 'expo-auth-session';
 import * as Linking from 'expo-linking';
 import * as WebBrowser from 'expo-web-browser';
 import { supabase } from './lib/supabase';
+import type { DatabaseGarmentRow } from './lib/supabase';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -52,7 +54,7 @@ type FaceBox = { xMin: number; yMin: number; xMax: number; yMax: number };
 type OutfitEvaluation = { score: number; summary: string; strengths: string[]; improvements: string[]; suggestions: string[] };
 type PersonAnalysis = { id: number; position: string; faceVisible: boolean; faceBox: FaceBox; items: Garment[]; outfitEvaluation?: OutfitEvaluation };
 type GarmentFingerprint = Pick<Garment, 'category' | 'subcategory' | 'primaryColor' | 'brand' | 'pattern' | 'fabricType' | 'styles'>;
-type SavedGarment = Garment & { id: string; imageUri: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
+type SavedGarment = Garment & { id: string; imageUri: string; storagePath?: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
 type DuplicateMatch = { candidateId: string; candidate: SavedGarment; saved: SavedGarment; bestImage: 'candidate' | 'saved' };
 type DuplicateReview = { croppedItems: SavedGarment[]; matches: DuplicateMatch[]; wornItemIds: string[]; updatedItems: SavedGarment[] };
 type SavedOutfit = { id: string; imageUri: string; garments: Garment[]; evaluation: OutfitEvaluation | null; createdAt: string };
@@ -197,6 +199,72 @@ const mergeScans = (saved: SavedGarment, candidate: SavedGarment, bestImage: 'ca
     scanFingerprint: saved.scanFingerprint || candidate.scanFingerprint,
   };
 };
+
+const GARMENT_BUCKET = 'garment-images';
+const toStringArray = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+const isLocalImage = (uri: string) => uri.startsWith('file:') || uri.startsWith('content:');
+
+const uploadGarmentImage = async (userId: string, uri: string, existingPath?: string) => {
+  const file = new File(uri);
+  const content = await file.arrayBuffer();
+  if (!content.byteLength) throw new Error('No hemos podido leer la foto de la prenda.');
+  const path = existingPath || `${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.jpg`;
+  const { error } = await supabase.storage.from(GARMENT_BUCKET).upload(path, content, {
+    contentType: 'image/jpeg',
+    cacheControl: '31536000',
+    upsert: Boolean(existingPath),
+  });
+  if (error) throw new Error(`No hemos podido subir la foto: ${error.message}`);
+  return path;
+};
+
+const signedGarmentUrl = async (path: string) => {
+  const { data, error } = await supabase.storage.from(GARMENT_BUCKET).createSignedUrl(path, 60 * 60 * 24);
+  if (error || !data?.signedUrl) throw new Error(`No hemos podido abrir la foto: ${error?.message || 'URL no disponible'}`);
+  return data.signedUrl;
+};
+
+const garmentPayload = (item: SavedGarment, imagePath: string) => ({
+  custom_name: item.customName?.trim() || null,
+  category: item.category || '',
+  subcategory: item.subcategory || '',
+  primary_color: item.primaryColor || '',
+  secondary_colors: item.secondaryColors || [],
+  styles: item.styles || [],
+  pattern: item.pattern || '',
+  brand: item.brand || '',
+  material_estimate: item.materialEstimate || '',
+  fabric_type: item.fabricType || '',
+  texture: item.texture || '',
+  material_confidence: item.materialConfidence || 0,
+  confidence: item.confidence || 0,
+  image_path: imagePath,
+  wear_count: item.wearCount || 1,
+  scan_fingerprint: item.scanFingerprint || null,
+});
+
+const rowToSavedGarment = (row: DatabaseGarmentRow, imageUri: string): SavedGarment => ({
+  id: row.id,
+  imageUri,
+  storagePath: row.image_path,
+  wearCount: row.wear_count,
+  customName: row.custom_name || undefined,
+  category: row.category,
+  subcategory: row.subcategory,
+  primaryColor: row.primary_color,
+  secondaryColors: toStringArray(row.secondary_colors),
+  styles: toStringArray(row.styles),
+  pattern: row.pattern,
+  brand: row.brand,
+  materialEstimate: row.material_estimate,
+  fabricType: row.fabric_type,
+  texture: row.texture,
+  materialConfidence: row.material_confidence,
+  confidence: row.confidence,
+  scanFingerprint: row.scan_fingerprint as GarmentFingerprint | undefined,
+  itemBox: { xMin: 0, yMin: 0, xMax: 1000, yMax: 1000 },
+  displayRotation: 0,
+});
 
 const analysisMessages = [
   'Preparando tu armario',
@@ -568,7 +636,7 @@ function Profile({ onBack, email, displayName, onSignOut, onEditSetup }: { onBac
   </ScrollView>;
 }
 
-function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = false }: { onSave: (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => void; onOutfitSave: (outfit: SavedOutfit) => void; wardrobeItems: SavedGarment[]; startWithCamera?: boolean }) {
+function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = false }: { onSave: (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => Promise<void>; onOutfitSave: (outfit: SavedOutfit) => void; wardrobeItems: SavedGarment[]; startWithCamera?: boolean }) {
   const { showNotice } = useNotice();
   const [stage, setStage] = useState<AddStage>('upload');
   const [imageUri, setImageUri] = useState<string | null>(null);
@@ -843,7 +911,7 @@ function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = fals
         setStage('duplicates');
         return;
       }
-      onSave(croppedItems, [], []);
+      await onSave(croppedItems, [], []);
     } finally {
       setSaving(false);
     }
@@ -930,7 +998,7 @@ function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = fals
     }
     setDuplicateReview(null);
     setDuplicateIndex(0);
-    onSave(nextReview.croppedItems, nextReview.wornItemIds, nextReview.updatedItems);
+    void onSave(nextReview.croppedItems, nextReview.wornItemIds, nextReview.updatedItems);
   };
 
   if (stage === 'duplicates' && duplicateReview) {
@@ -1275,6 +1343,7 @@ export default function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [wardrobeLoading, setWardrobeLoading] = useState(false);
   const [onboardingCompleted, setOnboardingCompleted] = useState(false);
   const [savedGarments, setSavedGarments] = useState<SavedGarment[]>([]);
   const [savedOutfits, setSavedOutfits] = useState<SavedOutfit[]>([]);
@@ -1353,44 +1422,128 @@ export default function App() {
       authSubscription.subscription.unsubscribe();
     };
   }, []);
-  const saveToWardrobe = (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => {
-    const addedUses = wornItemIds.reduce<Record<string, number>>((counts, id) => ({ ...counts, [id]: (counts[id] || 0) + 1 }), {});
-    const updatesById = new Map(updatedItems.map((item) => [item.id, item]));
-    setSavedGarments((current) => [...items, ...current.map((item) => {
-      const enrichedItem = updatesById.get(item.id) || item;
-      return addedUses[item.id] ? { ...enrichedItem, wearCount: (enrichedItem.wearCount || 1) + addedUses[item.id] } : enrichedItem;
-    })]);
-    setWardrobeInitialCategory('todas');
-    setTab('armario');
-    if (items.length === 0 && wornItemIds.length > 0) {
-      const toastMessage = wornItemIds.length === 1
-        ? 'La prenda ya estaba en tu armario. Hemos actualizado su ficha y sumado un uso.'
-        : `Las ${wornItemIds.length} prendas ya estaban en tu armario. Hemos actualizado sus fichas y sumado sus usos.`;
-      setNotice({ title: 'Usos actualizados', message: toastMessage });
+  useEffect(() => {
+    if (!session?.user.id) {
+      setSavedGarments([]);
       return;
     }
-    const messages = [];
-    if (items.length > 0) messages.push(`Hemos añadido ${items.length} ${items.length === 1 ? 'prenda' : 'prendas'} a tu armario.`);
-    if (wornItemIds.length > 0) messages.push(`Hemos registrado ${wornItemIds.length} ${wornItemIds.length === 1 ? 'nuevo uso' : 'nuevos usos'}.`);
-    setNotice({ title: 'Outfit guardado', message: messages.join('\n') });
-  };
-  const deleteFromWardrobe = (id: string) => {
-    setSavedGarments((current) => current.filter((item) => item.id !== id));
-    setNotice({ title: 'Prenda eliminada', message: 'La prenda se ha eliminado del armario.' });
-  };
-  const mergeWardrobeItems = (keptId: string, mergedId: string) => {
-    setSavedGarments((current) => {
-      const mergedItem = current.find((item) => item.id === mergedId);
-      if (!mergedItem) return current;
-      return current
-        .filter((item) => item.id !== mergedId)
-        .map((item) => item.id === keptId ? { ...item, wearCount: (item.wearCount || 1) + (mergedItem.wearCount || 1) } : item);
+    let active = true;
+    setWardrobeLoading(true);
+    void (async () => {
+      const { data, error } = await supabase.from('garments').select('*').order('created_at', { ascending: false });
+      if (error) {
+        console.error('[Supabase] Error cargando el armario:', error);
+        if (active) setNotice({ title: 'No hemos podido cargar tu armario', message: error.message });
+        return;
+      }
+      const garments = await Promise.all((data as DatabaseGarmentRow[]).map(async (row) => {
+        try {
+          return rowToSavedGarment(row, await signedGarmentUrl(row.image_path));
+        } catch (error) {
+          console.warn('[Supabase] No se pudo firmar una foto del armario:', error);
+          return null;
+        }
+      }));
+      if (active) setSavedGarments(garments.filter((item): item is SavedGarment => item !== null));
+    })().catch((error) => {
+      console.error('[Supabase] Error inesperado cargando el armario:', error);
+    }).finally(() => {
+      if (active) setWardrobeLoading(false);
     });
-    setNotice({ title: 'Prendas fusionadas', message: 'Hemos combinado sus usos y datos.' });
+    return () => { active = false; };
+  }, [session?.user.id]);
+
+  const persistGarment = async (item: SavedGarment) => {
+    if (!session?.user.id) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
+    const storagePath = await uploadGarmentImage(session.user.id, item.imageUri);
+    const { data, error } = await supabase.from('garments').insert({ user_id: session.user.id, ...garmentPayload(item, storagePath) }).select().single();
+    if (error || !data) {
+      await supabase.storage.from(GARMENT_BUCKET).remove([storagePath]);
+      throw new Error(error?.message || 'No hemos podido guardar la prenda.');
+    }
+    return rowToSavedGarment(data as DatabaseGarmentRow, await signedGarmentUrl(storagePath));
   };
-  const updateWardrobeItem = (updatedItem: SavedGarment) => {
-    setSavedGarments((current) => current.map((item) => item.id === updatedItem.id ? updatedItem : item));
-    setNotice({ title: 'Cambios guardados', message: 'La ficha de la prenda se ha actualizado.' });
+
+  const saveToWardrobe = async (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => {
+    try {
+      const persistedItems = await Promise.all(items.map(persistGarment));
+      const updatesById = new Map(updatedItems.map((item) => [item.id, item]));
+      const nextExistingItems = await Promise.all(savedGarments.map(async (item) => {
+        const updated = updatesById.get(item.id) || item;
+        const wearCount = (updated.wearCount || item.wearCount || 1) + (wornItemIds.includes(item.id) ? 1 : 0);
+        if (!updatesById.has(item.id) && !wornItemIds.includes(item.id)) return item;
+        let storagePath = updated.storagePath || item.storagePath;
+        if (isLocalImage(updated.imageUri)) storagePath = await uploadGarmentImage(session!.user.id, updated.imageUri, storagePath);
+        const { data, error } = await supabase.from('garments').update(garmentPayload({ ...updated, wearCount }, storagePath || '')).eq('id', item.id).select().single();
+        if (error || !data) throw new Error(error?.message || 'No hemos podido actualizar una prenda.');
+        return rowToSavedGarment(data as DatabaseGarmentRow, storagePath ? await signedGarmentUrl(storagePath) : item.imageUri);
+      }));
+      setSavedGarments([...persistedItems, ...nextExistingItems]);
+      setWardrobeInitialCategory('todas');
+      setTab('armario');
+      if (items.length === 0 && wornItemIds.length > 0) {
+        setNotice({ title: 'Usos actualizados', message: wornItemIds.length === 1 ? 'La prenda ya estaba en tu armario. Hemos actualizado su ficha y sumado un uso.' : `Las ${wornItemIds.length} prendas ya estaban en tu armario. Hemos actualizado sus fichas y sumado sus usos.` });
+        return;
+      }
+      const messages = [];
+      if (items.length > 0) messages.push(`Hemos añadido ${items.length} ${items.length === 1 ? 'prenda' : 'prendas'} a tu armario.`);
+      if (wornItemIds.length > 0) messages.push(`Hemos registrado ${wornItemIds.length} ${wornItemIds.length === 1 ? 'nuevo uso' : 'nuevos usos'}.`);
+      setNotice({ title: 'Armario guardado', message: messages.join('\n') });
+    } catch (error) {
+      console.error('[Supabase] Error guardando el armario:', error);
+      setNotice({ title: 'No hemos podido guardar el armario', message: error instanceof Error ? error.message : 'Comprueba tu conexión e inténtalo de nuevo.' });
+      throw error;
+    }
+  };
+  const deleteFromWardrobe = async (id: string) => {
+    const item = savedGarments.find((garment) => garment.id === id);
+    try {
+      const { error } = await supabase.from('garments').delete().eq('id', id);
+      if (error) throw error;
+      if (item?.storagePath) {
+        const { error: storageError } = await supabase.storage.from(GARMENT_BUCKET).remove([item.storagePath]);
+        if (storageError) console.warn('[Supabase] La ficha se eliminó, pero no la imagen:', storageError.message);
+      }
+      setSavedGarments((current) => current.filter((garment) => garment.id !== id));
+      setNotice({ title: 'Prenda eliminada', message: 'La prenda y su foto se han eliminado del armario.' });
+    } catch (error) {
+      setNotice({ title: 'No hemos podido eliminar la prenda', message: error instanceof Error ? error.message : 'Vuelve a intentarlo.' });
+    }
+  };
+  const mergeWardrobeItems = async (keptId: string, mergedId: string) => {
+    const keptItem = savedGarments.find((item) => item.id === keptId);
+    const mergedItem = savedGarments.find((item) => item.id === mergedId);
+    if (!keptItem || !mergedItem) return;
+    try {
+      const mergedWearCount = (keptItem.wearCount || 1) + (mergedItem.wearCount || 1);
+      const { data, error } = await supabase.from('garments').update(garmentPayload({ ...keptItem, wearCount: mergedWearCount }, keptItem.storagePath || '')).eq('id', keptId).select().single();
+      if (error || !data) throw new Error(error?.message || 'No hemos podido fusionar las prendas.');
+      const { error: deleteError } = await supabase.from('garments').delete().eq('id', mergedId);
+      if (deleteError) throw deleteError;
+      if (mergedItem.storagePath) await supabase.storage.from(GARMENT_BUCKET).remove([mergedItem.storagePath]);
+      const persistedKept = rowToSavedGarment(data as DatabaseGarmentRow, keptItem.storagePath ? await signedGarmentUrl(keptItem.storagePath) : keptItem.imageUri);
+      setSavedGarments((current) => current.filter((item) => item.id !== mergedId).map((item) => item.id === keptId ? persistedKept : item));
+      setNotice({ title: 'Prendas fusionadas', message: 'Hemos combinado sus usos y eliminado la foto duplicada.' });
+    } catch (error) {
+      setNotice({ title: 'No hemos podido fusionar las prendas', message: error instanceof Error ? error.message : 'Vuelve a intentarlo.' });
+    }
+  };
+  const updateWardrobeItem = async (updatedItem: SavedGarment) => {
+    try {
+      let storagePath = updatedItem.storagePath;
+      if (isLocalImage(updatedItem.imageUri)) {
+        if (!session?.user.id) throw new Error('Tu sesión ha caducado.');
+        storagePath = await uploadGarmentImage(session.user.id, updatedItem.imageUri, storagePath);
+      }
+      if (!storagePath) throw new Error('No se ha encontrado la foto de esta prenda.');
+      const { data, error } = await supabase.from('garments').update(garmentPayload(updatedItem, storagePath)).eq('id', updatedItem.id).select().single();
+      if (error || !data) throw new Error(error?.message || 'No hemos podido guardar los cambios.');
+      const persistedItem = rowToSavedGarment(data as DatabaseGarmentRow, await signedGarmentUrl(storagePath));
+      setSavedGarments((current) => current.map((item) => item.id === persistedItem.id ? persistedItem : item));
+      setNotice({ title: 'Cambios guardados', message: 'La ficha de la prenda se ha actualizado.' });
+    } catch (error) {
+      setNotice({ title: 'No hemos podido guardar los cambios', message: error instanceof Error ? error.message : 'Vuelve a intentarlo.' });
+    }
   };
   const deleteOutfit = (id: string) => setSavedOutfits((current) => current.filter((outfit) => outfit.id !== id));
   const restoreOutfit = (outfit: SavedOutfit) => setSavedOutfits((current) => current.some((item) => item.id === outfit.id) ? current : [outfit, ...current]);
@@ -1402,7 +1555,7 @@ export default function App() {
     setTab('inicio');
     setOnboardingCompleted(false);
   };
-  if (authLoading) return <SafeAreaView style={styles.safe}><StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} /><View style={styles.authLoading}><ActivityIndicator color={COLORS.sageDark} /><Text style={styles.authLoadingText}>Conectando con tu armario…</Text></View></SafeAreaView>;
+  if (authLoading || (session && wardrobeLoading)) return <SafeAreaView style={styles.safe}><StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} /><View style={styles.authLoading}><ActivityIndicator color={COLORS.sageDark} /><Text style={styles.authLoadingText}>Conectando con tu armario…</Text></View></SafeAreaView>;
   if (!session) return <LoginScreen />;
   if (!onboardingCompleted) return <OnboardingScreen initialName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || ''} initialGender={session.user.user_metadata?.gender_identity} initialStyles={session.user.user_metadata?.style_preferences} initialColors={session.user.user_metadata?.color_preferences} initialShops={session.user.user_metadata?.favorite_shops} onComplete={() => setOnboardingCompleted(true)} />;
   return <NoticeContext.Provider value={{ showNotice: setNotice }}><SafeAreaView style={styles.safe}>
