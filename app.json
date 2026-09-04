@@ -3,6 +3,7 @@
     "name": "Armario",
     "slug": "armario-virtual",
     "version": "0.0.1",
+    "icon": "./assets/icon.png",
     "scheme": "armario-virtual",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -13,6 +14,10 @@
     },
     "android": {
       "package": "com.armariovirtual.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#201D1A"
+      },
       "permissions": [
         "android.permission.RECORD_AUDIO"
       ]
