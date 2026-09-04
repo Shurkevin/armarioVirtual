@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="960" viewBox="0 0 1600 960">
+  <defs>
+    <clipPath id="iosMask"><rect x="130" y="250" width="540" height="540" rx="122"/></clipPath>
+    <clipPath id="androidMask"><circle cx="1180" cy="520" r="270"/></clipPath>
+  </defs>
+  <rect width="1600" height="960" fill="#F7F4EF"/>
+  <text x="400" y="120" text-anchor="middle" fill="#201D1A" font-family="Arial, sans-serif" font-size="42" font-weight="700">iOS</text>
+  <text x="400" y="174" text-anchor="middle" fill="#7C7771" font-family="Arial, sans-serif" font-size="25">Icono completo</text>
+  <rect x="130" y="250" width="540" height="540" rx="122" fill="#201D1A"/>
+  <image href="file:///Users/origds/.codex/generated_images/01a06887-9414-7161-99ca-a1ceabfbf8a8/exec-6bb208d4-071e-4fa8-889e-e8c1f32265d1.png" x="130" y="250" width="540" height="540" clip-path="url(#iosMask)" preserveAspectRatio="xMidYMid slice"/>
+  <text x="1180" y="120" text-anchor="middle" fill="#201D1A" font-family="Arial, sans-serif" font-size="42" font-weight="700">Android</text>
+  <text x="1180" y="174" text-anchor="middle" fill="#7C7771" font-family="Arial, sans-serif" font-size="25">Adaptativo · zona segura</text>
+  <circle cx="1180" cy="520" r="270" fill="#201D1A"/>
+  <g clip-path="url(#androidMask)">
+    <image href="file:///Users/origds/.codex/generated_images/01a06887-9414-7161-99ca-a1ceabfbf8a8/exec-6bb208d4-071e-4fa8-889e-e8c1f32265d1.png" x="1004" y="344" width="352" height="352" preserveAspectRatio="xMidYMid slice"/>
+  </g>
+  <circle cx="1180" cy="520" r="270" fill="none" stroke="#E8DED0" stroke-width="4" opacity=".7"/>
+  <path d="M910 840H1450" stroke="#E8E2DA" stroke-width="2"/>
+  <text x="400" y="870" text-anchor="middle" fill="#50614A" font-family="Arial, sans-serif" font-size="23" font-weight="700">Sin recortar elementos</text>
+  <text x="1180" y="870" text-anchor="middle" fill="#50614A" font-family="Arial, sans-serif" font-size="23" font-weight="700">Armario centrado y protegido</text>
+</svg>
