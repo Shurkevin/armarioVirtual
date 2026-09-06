@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import cors from 'cors';
 import express from 'express';
@@ -12,20 +12,45 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .map((origin) => origin.trim())
   .filter(Boolean);
 const GEMINI_RETRY_DELAYS_MS = [2500, 6000, 12000];
+const COMPARISON_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const COMPARISON_CACHE_MAX_ENTRIES = 500;
+const comparisonCache = new Map();
+const imageDigest = (buffer) => createHash('sha256').update(buffer).digest('hex');
+const readComparisonCache = (key) => {
+  const entry = comparisonCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    comparisonCache.delete(key);
+    return null;
+  }
+  comparisonCache.delete(key);
+  comparisonCache.set(key, entry);
+  return entry.value;
+};
+const writeComparisonCache = (key, value) => {
+  comparisonCache.set(key, { value, expiresAt: Date.now() + COMPARISON_CACHE_TTL_MS });
+  while (comparisonCache.size > COMPARISON_CACHE_MAX_ENTRIES) {
+    comparisonCache.delete(comparisonCache.keys().next().value);
+  }
+};
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const fetchGeminiWithRetry = async ({ url, options, log }) => {
   let lastNetworkError;
   for (let attempt = 0; attempt <= GEMINI_RETRY_DELAYS_MS.length; attempt += 1) {
     try {
       const response = await fetch(url, options);
-      if (response.status !== 503 || attempt === GEMINI_RETRY_DELAYS_MS.length) return response;
+      if (response.status !== 503 || attempt === GEMINI_RETRY_DELAYS_MS.length) {
+        return { response, attemptCount: attempt + 1 };
+      }
       const delay = GEMINI_RETRY_DELAYS_MS[attempt];
       log(`Gemini está temporalmente saturado (HTTP 503). Reintentaremos en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
       await response.body?.cancel();
       await wait(delay);
     } catch (error) {
       lastNetworkError = error;
-      if (attempt === GEMINI_RETRY_DELAYS_MS.length) throw error;
+      if (attempt === GEMINI_RETRY_DELAYS_MS.length) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { geminiAttemptCount: attempt + 1 });
+      }
       const delay = GEMINI_RETRY_DELAYS_MS[attempt];
       log(`No se ha podido contactar con Gemini. Reintentaremos en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
       await wait(delay);
@@ -141,35 +166,56 @@ app.get('/health', (_request, response) => {
 app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 }, { name: 'saved', maxCount: 1 }]), async (request, response) => {
   const requestId = randomUUID().slice(0, 8);
   const startedAt = Date.now();
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  const thinkingLevel = process.env.GEMINI_THINKING_LEVEL || 'minimal';
+  let providerDurationMs = 0;
+  let providerAttemptCount = 0;
+  let cacheHit = false;
   const log = (message) => console.log(`[${new Date().toISOString()}] [${requestId}] ${message}`);
+  const comparisonMeta = () => ({
+    requestId,
+    model,
+    serverDurationMs: Date.now() - startedAt,
+    providerDurationMs,
+    providerAttemptCount,
+    cacheHit,
+    candidateBytes: request.files?.candidate?.[0]?.size || null,
+    savedBytes: request.files?.saved?.[0]?.size || null,
+  });
   const candidate = request.files?.candidate?.[0];
   const saved = request.files?.saved?.[0];
-  if (!candidate || !saved) return response.status(400).json({ error: 'Faltan las dos fotos que hay que comparar.' });
-  if (!process.env.GEMINI_API_KEY) return response.status(503).json({ error: 'El servidor no tiene configurada GEMINI_API_KEY.' });
+  if (!candidate || !saved) return response.status(400).json({ error: 'Faltan las dos fotos que hay que comparar.', _analysisMeta: comparisonMeta() });
+  if (!process.env.GEMINI_API_KEY) return response.status(503).json({ error: 'El servidor no tiene configurada GEMINI_API_KEY.', _analysisMeta: comparisonMeta() });
 
   try {
-    const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+    const cacheKey = `${model}:${thinkingLevel}:v2:${imageDigest(candidate.buffer)}:${imageDigest(saved.buffer)}`;
+    const cachedComparison = readComparisonCache(cacheKey);
+    if (cachedComparison) {
+      cacheHit = true;
+      log('Comparación recuperada de caché.');
+      return response.json({ ...cachedComparison, _analysisMeta: comparisonMeta() });
+    }
     log(`Fotos de comparación recibidas: nueva ${(candidate.size / 1024).toFixed(0)} KB, guardada ${(saved.size / 1024).toFixed(0)} KB.`);
     log(`Comparando visualmente dos prendas con Gemini (${model})…`);
     const geminiStartedAt = Date.now();
     const waitingLog = setInterval(() => log(`Gemini sigue comparando las prendas… ${Math.round((Date.now() - geminiStartedAt) / 1000)} s de espera.`), 5000);
     let geminiResponse;
     try {
-      geminiResponse = await fetchGeminiWithRetry({
+      const geminiResult = await fetchGeminiWithRetry({
       url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
       options: {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
         body: JSON.stringify({
         contents: [{ role: 'user', parts: [
-          { text: 'Compara estas dos fotos recortadas de prendas. Determina si probablemente muestran exactamente la misma prenda física, aunque cambien la pose, iluminación, escala u oclusión. No basta con que sean del mismo tipo y color: busca coincidencias en corte, costuras, estampado, logotipo, textura y detalles distintivos. La primera imagen es la nueva y la segunda ya está en el armario. Indica también en bestImage cuál es mejor como foto principal de armario: candidate si la nueva muestra la prenda con más nitidez, tamaño, integridad y menos oclusiones; saved si la guardada es mejor.' },
+          { text: 'Compara estas dos fotos recortadas de prendas. Determina si probablemente muestran exactamente la misma prenda física, aunque cambien la pose, iluminación, escala u oclusión. No basta con que sean del mismo tipo y color: busca coincidencias en corte, costuras, estampado, logotipo, tipo de tejido, textura y detalles distintivos. Da prioridad a la construcción y apariencia visible del tejido; no intentes deducir su composición de fibras. La primera imagen es la nueva y la segunda ya está en el armario. Indica también en bestImage cuál es mejor como foto principal de armario: candidate si la nueva muestra la prenda con más nitidez, tamaño, integridad y menos oclusiones; saved si la guardada es mejor.' },
           { text: 'IMAGEN NUEVA' },
           { inlineData: { mimeType: candidate.mimetype, data: candidate.buffer.toString('base64') } },
           { text: 'IMAGEN GUARDADA' },
           { inlineData: { mimeType: saved.mimetype, data: saved.buffer.toString('base64') } },
         ] }],
         generationConfig: {
-          thinkingConfig: { thinkingLevel: process.env.GEMINI_THINKING_LEVEL || 'minimal' },
+          thinkingConfig: { thinkingLevel },
           maxOutputTokens: 256,
           responseMimeType: 'application/json',
           responseJsonSchema: {
@@ -188,8 +234,11 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
       },
       log,
       });
+      geminiResponse = geminiResult.response;
+      providerAttemptCount = geminiResult.attemptCount;
     } finally {
       clearInterval(waitingLog);
+      providerDurationMs = Date.now() - geminiStartedAt;
     }
     log(`Gemini ha respondido a la comparación con HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
     const result = await geminiResponse.json();
@@ -197,11 +246,13 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
     const outputText = result?.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text;
     if (!outputText) throw new Error('Gemini no devolvió una comparación utilizable.');
     const comparison = JSON.parse(outputText);
+    writeComparisonCache(cacheKey, comparison);
     log(`Comparación completada en ${Date.now() - startedAt} ms: ${comparison.sameGarment ? 'posible duplicado' : 'prendas distintas'} (${Math.round(comparison.confidence * 100)}%).`);
-    response.json(comparison);
+    response.json({ ...comparison, _analysisMeta: comparisonMeta() });
   } catch (error) {
+    providerAttemptCount = error?.geminiAttemptCount || providerAttemptCount;
     console.error(`[${new Date().toISOString()}] [${requestId}] Error comparando prendas:`, error?.message || error);
-    response.status(502).json({ error: 'No se han podido comparar visualmente las prendas.' });
+    response.status(502).json({ error: 'No se han podido comparar visualmente las prendas.', _analysisMeta: comparisonMeta() });
   }
 });
 
@@ -211,6 +262,9 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
   const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   let providerStartedAt;
   let providerDurationMs;
+  let providerAttemptCount = 0;
+  let postprocessStartedAt;
+  let postprocessDurationMs;
   const log = (message) => console.log(`[${new Date().toISOString()}] [${requestId}] ${message}`);
   const analysisMeta = () => ({
     requestId,
@@ -218,6 +272,10 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     serverDurationMs: Date.now() - startedAt,
     providerDurationMs: providerDurationMs
       ?? (providerStartedAt ? Date.now() - providerStartedAt : null),
+    providerAttemptCount,
+    postprocessDurationMs: postprocessDurationMs
+      ?? (postprocessStartedAt ? Date.now() - postprocessStartedAt : null),
+    imageBytes: request.file?.size || null,
   });
   const sendError = (status, error) => response.status(status).json({ error, _analysisMeta: analysisMeta() });
 
@@ -243,7 +301,7 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     }, 5000);
     let geminiResponse;
     try {
-      geminiResponse = await fetchGeminiWithRetry({
+      const geminiResult = await fetchGeminiWithRetry({
       url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
       options: {
         method: 'POST',
@@ -259,6 +317,7 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
           role: 'user',
           parts: [
             { text: 'No incluyas gafas, gafas de sol, anteojos, lentes ni ningún tipo de eyewear entre las prendas o accesorios. Tampoco incluyas auriculares, cascos de audio, earbuds, AirPods ni ningún otro dispositivo de sonido.' },
+            { text: 'Prioriza la identificación del tipo o construcción visible del tejido en fabricType (por ejemplo punto, tejido plano, denim, pana, cuero, encaje o tejido técnico) y su textura. La composición de fibras en materialEstimate es secundaria y rara vez puede saberse por una foto: no dediques esfuerzo a adivinarla; si no hay evidencia visual clara devuelve “no determinable” o una estimación prudente con materialConfidence baja.' },
             { text: 'No tengas en cuenta bebés ni niños muy pequeños: no los devuelvas como personas seleccionables, no enumeres sus prendas y no confundas su ropa o accesorios con los de los adultos que aparecen en la foto. Si hay al menos uno claramente visible, establece youngChildDetected en true; úsalo únicamente como señal de exclusión, sin estimar edades ni describir al menor.' },
             { text: 'En la valoración del outfit usa un criterio positivo y ligeramente más generoso: un conjunto bien coordinado y apropiado puede estar en 80-89; reserva 90-94 para conjuntos especialmente logrados y 95-100 solo para resultados excepcionales. Usa notas inferiores a 70 únicamente si hay problemas visuales claros y relevantes.' },
             { text: 'Detecta las personas visibles y valora para cada una foregroundSubject y prominence entre 0 y 1. Ordénalas de izquierda a derecha y asigna ids consecutivos empezando por 1. Describe su posición brevemente sin usar rasgos personales. Indica si su cara es visible y devuelve faceBox con xMin, yMin, xMax e yMax entre 0 y 1000; si no es visible usa ceros. Para cada persona enumera las prendas y accesorios que lleva y genera outfitEvaluation: una valoración breve y amable basada solo en lo visible del conjunto (coordinación de colores, equilibrio, ocasión y acabado), con score de 0 a 100, summary, 1-3 strengths, 1-3 improvements y 1-3 suggestions accionables de vestimenta que harían que el conjunto combinase o se viera mejor. Usa una escala exigente y amplia: 50-59 es un conjunto correcto pero con varios aspectos visuales mejorables; 60-69 es bueno; 70-79 muy bueno; 80-89 excelente y coherente; 90-94 sobresaliente; reserva 95-100 para estilismos excepcionales, impecables y especialmente memorables. No concentres las puntuaciones entre 80 y 88: penaliza de forma proporcionada incompatibilidades de color, proporción, formalidad, acabado o falta de intención estilística. Las mejoras deben ser exclusivamente estéticas y de styling: no recomiendes prendas por el clima, comodidad, protección, utilidad, seguridad ni planes hipotéticos (por ejemplo, no sugieras añadir una chaqueta por si cambia el tiempo). No juzgues el cuerpo, atractivo, género, edad ni rasgos personales, y no inventes prendas que no se vean. Para cada prenda devuelve itemBox, un rectángulo lo más ajustado posible con xMin, yMin, xMax e yMax entre 0 y 1000. Incluye categoría, subcategoría, color principal, colores secundarios, estilos, estampado, marca claramente visible en brand (o cadena vacía), composición aparente en materialEstimate, tipo de construcción en fabricType, textura visible en texture, confianza específica del material entre 0 y 1 y confianza general entre 0 y 1. En el color sé preciso y descriptivo. Usa nombres canónicos en español, en singular y forma base: “beige” (no “beis”), “marrón” (no “café”), “rosa” (no “rosado”), “caqui” (no “kaki” ni “khaki”) y “fucsia” (no “fuchsia”). Conserva matices como claro, oscuro, pastel o marino. El color principal debe incluir la combinación cuando la prenda tenga varios colores visibles (por ejemplo, “blanco y negro” para una camisa de rayas blancas y negras), colores secundarios debe listar todos los colores claramente apreciables y su orden no importa. No uses solo el color dominante ni omitas rayas, cuadros, bloques o estampados bicolor; si un color ocupa una parte relevante, inclúyelo aunque sea secundario.' },
@@ -320,8 +379,8 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
                           styles: { type: 'array', items: { type: 'string' } },
                           pattern: { type: 'string' },
                           brand: { type: 'string' },
-                          materialEstimate: { type: 'string' },
-                          fabricType: { type: 'string' },
+                          materialEstimate: { type: 'string', description: 'Composición aparente secundaria; usa no determinable cuando no haya evidencia visual suficiente.' },
+                          fabricType: { type: 'string', description: 'Dato prioritario: construcción o tipo visible del tejido, no composición de fibras.' },
                           texture: { type: 'string' },
                           materialConfidence: { type: 'number' },
                           confidence: { type: 'number' },
@@ -353,14 +412,18 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
       },
       log,
       });
+      geminiResponse = geminiResult.response;
+      providerAttemptCount = geminiResult.attemptCount;
     } finally {
       clearInterval(waitingLog);
+      providerDurationMs = Date.now() - geminiStartedAt;
     }
 
     log(`Cabeceras recibidas de Gemini: HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
     const responseBodyStartedAt = Date.now();
     const result = await geminiResponse.json();
     providerDurationMs = Date.now() - geminiStartedAt;
+    postprocessStartedAt = Date.now();
     log(`Respuesta de Gemini descargada y parseada en ${Date.now() - responseBodyStartedAt} ms.`);
     if (!geminiResponse.ok) {
       const providerError = new Error(result?.error?.message || 'Error de Gemini');
@@ -403,9 +466,11 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     if (excludedItemCount > 0) log(`${excludedItemCount} elementos excluidos del armario (gafas o dispositivos de audio).`);
     if (mergedFootwearCount > 0) log(`${mergedFootwearCount} duplicados de calzado fusionados como pares.`);
     const garmentCount = analysis.people?.reduce((total, person) => total + (person.items?.length || 0), 0) || 0;
+    postprocessDurationMs = Date.now() - postprocessStartedAt;
     log(`Análisis completado: ${analysis.people?.length || 0} personas y ${garmentCount} prendas detectadas en ${Date.now() - startedAt} ms.`);
     response.json({ ...analysis, _analysisMeta: analysisMeta() });
   } catch (error) {
+    providerAttemptCount = error?.geminiAttemptCount || providerAttemptCount;
     console.error(`[${new Date().toISOString()}] [${requestId}] Error tras ${Date.now() - startedAt} ms:`, error?.message || error);
     if (error?.status === 503) {
       return sendError(503, 'Gemini está temporalmente saturado. Hemos reintentado el análisis varias veces; prueba de nuevo en un momento.');
