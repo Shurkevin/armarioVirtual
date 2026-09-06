@@ -36,8 +36,16 @@ create table if not exists public.outfits (
 create table if not exists public.outfit_garments (
   outfit_id uuid not null references public.outfits(id) on delete cascade,
   garment_id uuid not null references public.garments(id) on delete cascade,
+  item_box jsonb not null default '{"xMin":0,"yMin":0,"xMax":1000,"yMax":1000}'::jsonb,
+  display_rotation integer not null default 0,
+  confidence numeric not null default 0,
   primary key (outfit_id, garment_id)
 );
+
+-- Compatible con instalaciones que ya tenían la tabla creada.
+alter table public.outfit_garments add column if not exists item_box jsonb not null default '{"xMin":0,"yMin":0,"xMax":1000,"yMax":1000}'::jsonb;
+alter table public.outfit_garments add column if not exists display_rotation integer not null default 0;
+alter table public.outfit_garments add column if not exists confidence numeric not null default 0;
 
 create table if not exists public.garment_usage_events (
   id bigint generated always as identity primary key,

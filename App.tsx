@@ -27,7 +27,7 @@ import { makeRedirectUri } from 'expo-auth-session';
 import * as Linking from 'expo-linking';
 import * as WebBrowser from 'expo-web-browser';
 import { supabase } from './lib/supabase';
-import type { DatabaseGarmentRow } from './lib/supabase';
+import type { DatabaseGarmentRow, DatabaseOutfitRow } from './lib/supabase';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -56,8 +56,9 @@ type PersonAnalysis = { id: number; position: string; faceVisible: boolean; face
 type GarmentFingerprint = Pick<Garment, 'category' | 'subcategory' | 'primaryColor' | 'brand' | 'pattern' | 'fabricType' | 'styles'>;
 type SavedGarment = Garment & { id: string; imageUri: string; storagePath?: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
 type DuplicateMatch = { candidateId: string; candidate: SavedGarment; saved: SavedGarment; bestImage: 'candidate' | 'saved' };
-type DuplicateReview = { croppedItems: SavedGarment[]; matches: DuplicateMatch[]; wornItemIds: string[]; updatedItems: SavedGarment[] };
-type SavedOutfit = { id: string; imageUri: string; garments: Garment[]; evaluation: OutfitEvaluation | null; createdAt: string };
+type OutfitDraft = { imageUri: string; evaluation: OutfitEvaluation | null; createdAt: string };
+type DuplicateReview = { croppedItems: SavedGarment[]; appearanceItems: SavedGarment[]; matchedGarmentIds: Record<string, string>; outfit: OutfitDraft; matches: DuplicateMatch[]; wornItemIds: string[]; updatedItems: SavedGarment[] };
+type SavedOutfit = { id: string; imageUri: string; storagePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; createdAt: string };
 type NoticeAction = { label: string; onPress?: () => void; destructive?: boolean };
 type Notice = { title: string; message: string; actions?: NoticeAction[] };
 const NoticeContext = createContext<{ showNotice: (notice: Notice) => void }>({ showNotice: () => undefined });
@@ -201,6 +202,7 @@ const mergeScans = (saved: SavedGarment, candidate: SavedGarment, bestImage: 'ca
 };
 
 const GARMENT_BUCKET = 'garment-images';
+const OUTFIT_BUCKET = 'outfit-images';
 const toStringArray = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 const isLocalImage = (uri: string) => uri.startsWith('file:') || uri.startsWith('content:');
 
@@ -221,6 +223,25 @@ const uploadGarmentImage = async (userId: string, uri: string, existingPath?: st
 const signedGarmentUrl = async (path: string) => {
   const { data, error } = await supabase.storage.from(GARMENT_BUCKET).createSignedUrl(path, 60 * 60 * 24);
   if (error || !data?.signedUrl) throw new Error(`No hemos podido abrir la foto: ${error?.message || 'URL no disponible'}`);
+  return data.signedUrl;
+};
+
+const uploadOutfitImage = async (userId: string, uri: string) => {
+  const file = new File(uri);
+  const content = await file.arrayBuffer();
+  if (!content.byteLength) throw new Error('No hemos podido leer la foto del outfit.');
+  const path = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.jpg`;
+  const { error } = await supabase.storage.from(OUTFIT_BUCKET).upload(path, content, {
+    contentType: 'image/jpeg',
+    cacheControl: '31536000',
+  });
+  if (error) throw new Error(`No hemos podido subir la foto del outfit: ${error.message}`);
+  return path;
+};
+
+const signedOutfitUrl = async (path: string) => {
+  const { data, error } = await supabase.storage.from(OUTFIT_BUCKET).createSignedUrl(path, 60 * 60 * 24);
+  if (error || !data?.signedUrl) throw new Error(`No hemos podido abrir la foto del outfit: ${error?.message || 'URL no disponible'}`);
   return data.signedUrl;
 };
 
@@ -640,7 +661,7 @@ function Profile({ onBack, email, displayName, onSignOut, onEditSetup }: { onBac
   </ScrollView>;
 }
 
-function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = false, showOutfitScore = true, showImprovementPoints = true }: { onSave: (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => Promise<void>; onOutfitSave: (outfit: SavedOutfit) => void; wardrobeItems: SavedGarment[]; startWithCamera?: boolean; showOutfitScore?: boolean; showImprovementPoints?: boolean }) {
+function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitScore = true, showImprovementPoints = true }: { onSave: (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[], outfit: OutfitDraft, appearanceItems: SavedGarment[], matchedGarmentIds: Record<string, string>) => Promise<void>; wardrobeItems: SavedGarment[]; startWithCamera?: boolean; showOutfitScore?: boolean; showImprovementPoints?: boolean }) {
   const { showNotice } = useNotice();
   const [stage, setStage] = useState<AddStage>('upload');
   const [imageUri, setImageUri] = useState<string | null>(null);
@@ -876,7 +897,6 @@ function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = fals
     }
     setSaving(true);
     try {
-      onOutfitSave({ id: `${Date.now()}`, imageUri, garments: includedGarments, evaluation: outfitEvaluation, createdAt: photoDate || new Date().toISOString() });
       let croppedItems = await Promise.all(includedGarments.map(async (item, index) => ({
         ...item,
         id: `${Date.now()}-${index}`,
@@ -910,12 +930,20 @@ function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = fals
       }
       if (visualMatches.length > 0) {
         setSaving(false);
-        setDuplicateReview({ croppedItems, matches: visualMatches, wornItemIds: [], updatedItems: [] });
+        setDuplicateReview({
+          croppedItems,
+          appearanceItems: croppedItems,
+          matchedGarmentIds: {},
+          outfit: { imageUri, evaluation: outfitEvaluation, createdAt: photoDate || new Date().toISOString() },
+          matches: visualMatches,
+          wornItemIds: [],
+          updatedItems: [],
+        });
         setDuplicateIndex(0);
         setStage('duplicates');
         return;
       }
-      await onSave(croppedItems, [], []);
+      await onSave(croppedItems, [], [], { imageUri, evaluation: outfitEvaluation, createdAt: photoDate || new Date().toISOString() }, croppedItems, {});
     } finally {
       setSaving(false);
     }
@@ -991,6 +1019,7 @@ function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = fals
     const nextReview: DuplicateReview = sameGarment ? {
       ...duplicateReview,
       croppedItems: duplicateReview.croppedItems.filter((item) => item.id !== currentMatch.candidateId),
+      matchedGarmentIds: { ...duplicateReview.matchedGarmentIds, [currentMatch.candidateId]: currentMatch.saved.id },
       wornItemIds: [...duplicateReview.wornItemIds, currentMatch.saved.id],
       updatedItems: [...duplicateReview.updatedItems.filter((item) => item.id !== mergedItem.id), mergedItem],
     } : duplicateReview;
@@ -1002,7 +1031,7 @@ function AddOutfit({ onSave, onOutfitSave, wardrobeItems, startWithCamera = fals
     }
     setDuplicateReview(null);
     setDuplicateIndex(0);
-    void onSave(nextReview.croppedItems, nextReview.wornItemIds, nextReview.updatedItems);
+    void onSave(nextReview.croppedItems, nextReview.wornItemIds, nextReview.updatedItems, nextReview.outfit, nextReview.appearanceItems, nextReview.matchedGarmentIds);
   };
 
   if (stage === 'duplicates' && duplicateReview) {
@@ -1228,18 +1257,41 @@ function OutfitHistoryCard({ outfit, onOpen, onDelete, showOutfitScore }: { outf
   return <View style={{ height: 112, maxHeight: 112, flexGrow: 0, flexShrink: 0, marginBottom: 11, borderRadius: 18, overflow: 'hidden', backgroundColor: '#C95F55', flexDirection: 'row', justifyContent: 'space-between' }}>{deleteControl}{deleteControl}<Animated.View style={{ position: 'absolute', left: 0, right: 0, top: 0, height: 112, transform: [{ translateX }] }}><SwipeTouchable activeOpacity={0.86} onTouchStart={(event: any) => { startX.current = event.nativeEvent.pageX; horizontalGesture.current = false; }} onTouchMove={(event: any) => { const distance = event.nativeEvent.pageX - startX.current; if (Math.abs(distance) > 12) { horizontalGesture.current = true; translateX.setValue(Math.max(-92, Math.min(92, distance))); } }} onTouchEnd={(event: any) => { if (horizontalGesture.current) settleSwipe(event.nativeEvent.pageX - startX.current); }} onPress={() => { if (!horizontalGesture.current) onOpen(); horizontalGesture.current = false; }} style={{ flex: 1, backgroundColor: COLORS.white, flexDirection: 'row' }}><Image source={{ uri: outfit.imageUri }} style={{ width: 96, height: 112, backgroundColor: COLORS.sand }} /><View style={{ flex: 1, padding: 13, justifyContent: 'center' }}><Text style={styles.cardTitle}>{new Date(outfit.createdAt).toLocaleDateString('es-ES')}</Text>{outfit.evaluation && <>{showOutfitScore && <Text style={{ color: COLORS.sageDark, fontSize: 19, fontWeight: '800', marginTop: 5 }}>{Math.round(outfit.evaluation.score)}/100</Text>}<Text numberOfLines={2} style={[styles.reviewHint, { marginTop: showOutfitScore ? 4 : 7, marginBottom: 0 }]}>{outfit.evaluation.summary}</Text></>}<Feather name="chevron-right" size={18} color={COLORS.muted} style={{ position: 'absolute', right: 12, top: 13 }} /></View></SwipeTouchable></Animated.View></View>;
 }
 
-function Outfits({ outfits, onDelete, onRestore, showOutfitScore, showImprovementPoints }: { outfits: SavedOutfit[]; onDelete: (id: string) => void; onRestore: (outfit: SavedOutfit) => void; showOutfitScore: boolean; showImprovementPoints: boolean }) {
+function Outfits({ outfits, onDelete, onRestore, onDeletePermanent, showOutfitScore, showImprovementPoints }: { outfits: SavedOutfit[]; onDelete: (id: string) => void; onRestore: (outfit: SavedOutfit) => void; onDeletePermanent: (outfit: SavedOutfit) => Promise<void>; showOutfitScore: boolean; showImprovementPoints: boolean }) {
   const { showNotice } = useNotice();
   const [selectedOutfit, setSelectedOutfit] = useState<SavedOutfit | null>(null);
   const [fullScreenImage, setFullScreenImage] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'date' | 'score'>('date');
   const [recentlyDeleted, setRecentlyDeleted] = useState<SavedOutfit | null>(null);
+  const deleteTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingDeletion = useRef<SavedOutfit | null>(null);
+  useEffect(() => () => { if (deleteTimeout.current) clearTimeout(deleteTimeout.current); }, []);
   if (outfits.length === 0 && !recentlyDeleted) return <EmptyScreen tab="outfits" />;
   const orderedOutfits = [...outfits].sort((first, second) => !showOutfitScore || sortBy === 'date'
     ? new Date(second.createdAt).getTime() - new Date(first.createdAt).getTime()
     : (second.evaluation?.score || 0) - (first.evaluation?.score || 0));
-  const deleteOutfit = (outfit: SavedOutfit) => { setSelectedOutfit(null); onDelete(outfit.id); setRecentlyDeleted(outfit); setTimeout(() => setRecentlyDeleted((current) => current?.id === outfit.id ? null : current), 4000); };
-  const undoDelete = () => { if (recentlyDeleted) onRestore(recentlyDeleted); setRecentlyDeleted(null); };
+  const deleteOutfit = (outfit: SavedOutfit) => {
+    if (deleteTimeout.current) clearTimeout(deleteTimeout.current);
+    if (pendingDeletion.current) void onDeletePermanent(pendingDeletion.current);
+    setSelectedOutfit(null);
+    onDelete(outfit.id);
+    pendingDeletion.current = outfit;
+    setRecentlyDeleted(outfit);
+    deleteTimeout.current = setTimeout(() => {
+      const pending = pendingDeletion.current;
+      if (pending?.id === outfit.id) {
+        void onDeletePermanent(pending);
+        pendingDeletion.current = null;
+        setRecentlyDeleted(null);
+      }
+    }, 4000);
+  };
+  const undoDelete = () => {
+    if (deleteTimeout.current) clearTimeout(deleteTimeout.current);
+    if (recentlyDeleted) onRestore(recentlyDeleted);
+    pendingDeletion.current = null;
+    setRecentlyDeleted(null);
+  };
   return <>
     <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}><View style={{ height: 18 }} /><View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>HISTORIAL</Text><Text style={styles.title}>Tus outfits</Text><Text style={styles.addIntro}>{outfits.length} outfits analizados.</Text></View><View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}><TouchableOpacity onPress={() => setSortBy('date')} style={[styles.categoryFilter, sortBy === 'date' && styles.categoryFilterActive]}><Feather name="calendar" size={14} color={sortBy === 'date' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'date' && styles.categoryFilterTextActive]}>Más recientes</Text></TouchableOpacity>{showOutfitScore && <TouchableOpacity onPress={() => setSortBy('score')} style={[styles.categoryFilter, sortBy === 'score' && styles.categoryFilterActive]}><Feather name="star" size={14} color={sortBy === 'score' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'score' && styles.categoryFilterTextActive]}>Mejor puntuación</Text></TouchableOpacity>}</View>{orderedOutfits.map((outfit) => <OutfitHistoryCard key={outfit.id} outfit={outfit} onOpen={() => setSelectedOutfit(outfit)} onDelete={() => deleteOutfit(outfit)} showOutfitScore={showOutfitScore} />)}</ScrollView>
     <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><Image source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} /></TouchableOpacity>{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.materialEstimate} · {item.fabricType} · {item.texture}</Text><Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
@@ -1429,18 +1481,24 @@ export default function App() {
   useEffect(() => {
     if (!session?.user.id) {
       setSavedGarments([]);
+      setSavedOutfits([]);
       return;
     }
     let active = true;
     setWardrobeLoading(true);
     void (async () => {
-      const { data, error } = await supabase.from('garments').select('*').order('created_at', { ascending: false });
-      if (error) {
+      const [{ data: garmentRows, error: garmentError }, { data: outfitRows, error: outfitError }, { data: outfitGarmentRows, error: outfitGarmentError }] = await Promise.all([
+        supabase.from('garments').select('*').order('created_at', { ascending: false }),
+        supabase.from('outfits').select('*').order('taken_at', { ascending: false }),
+        supabase.from('outfit_garments').select('outfit_id, garment_id, item_box, display_rotation, confidence'),
+      ]);
+      if (garmentError || outfitError || outfitGarmentError) {
+        const error = garmentError || outfitError || outfitGarmentError;
         console.error('[Supabase] Error cargando el armario:', error);
-        if (active) setNotice({ title: 'No hemos podido cargar tu armario', message: error.message });
+        if (active) setNotice({ title: 'No hemos podido cargar tu armario', message: error?.message || 'Error desconocido' });
         return;
       }
-      const garments = await Promise.all((data as DatabaseGarmentRow[]).map(async (row) => {
+      const garments = await Promise.all((garmentRows as DatabaseGarmentRow[]).map(async (row) => {
         try {
           return rowToSavedGarment(row, await signedGarmentUrl(row.image_path));
         } catch (error) {
@@ -1448,7 +1506,33 @@ export default function App() {
           return null;
         }
       }));
-      if (active) setSavedGarments(garments.filter((item): item is SavedGarment => item !== null));
+      const hydratedGarments = garments.filter((item): item is SavedGarment => item !== null);
+      const garmentsById = new Map(hydratedGarments.map((item) => [item.id, item]));
+      const linksByOutfit = new Map<string, string[]>();
+      for (const link of outfitGarmentRows || []) {
+        const current = linksByOutfit.get(link.outfit_id) || [];
+        current.push(link.garment_id);
+        linksByOutfit.set(link.outfit_id, current);
+      }
+      const outfits: Array<SavedOutfit | null> = await Promise.all((outfitRows as DatabaseOutfitRow[]).map(async (row): Promise<SavedOutfit | null> => {
+        try {
+          return {
+            id: row.id,
+            imageUri: await signedOutfitUrl(row.image_path),
+            storagePath: row.image_path,
+            garments: (linksByOutfit.get(row.id) || []).map((id) => garmentsById.get(id)).filter((item): item is SavedGarment => Boolean(item)),
+            evaluation: row.evaluation as OutfitEvaluation | null,
+            createdAt: row.taken_at || row.created_at,
+          };
+        } catch (error) {
+          console.warn('[Supabase] No se pudo firmar una foto de outfit:', error);
+          return null;
+        }
+      }));
+      if (active) {
+        setSavedGarments(hydratedGarments);
+        setSavedOutfits(outfits.filter((item): item is SavedOutfit => item !== null));
+      }
     })().catch((error) => {
       console.error('[Supabase] Error inesperado cargando el armario:', error);
     }).finally(() => {
@@ -1468,8 +1552,11 @@ export default function App() {
     return rowToSavedGarment(data as DatabaseGarmentRow, await signedGarmentUrl(storagePath));
   };
 
-  const saveToWardrobe = async (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[]) => {
+  const saveToWardrobe = async (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[], outfit: OutfitDraft, appearanceItems: SavedGarment[], matchedGarmentIds: Record<string, string>) => {
+    let outfitStoragePath: string | null = null;
+    let persistedOutfitId: string | null = null;
     try {
+      if (!session?.user.id) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
       const persistedItems = await Promise.all(items.map(persistGarment));
       const updatesById = new Map(updatedItems.map((item) => [item.id, item]));
       const nextExistingItems = await Promise.all(savedGarments.map(async (item) => {
@@ -1482,7 +1569,52 @@ export default function App() {
         if (error || !data) throw new Error(error?.message || 'No hemos podido actualizar una prenda.');
         return rowToSavedGarment(data as DatabaseGarmentRow, storagePath ? await signedGarmentUrl(storagePath) : item.imageUri);
       }));
-      setSavedGarments([...persistedItems, ...nextExistingItems]);
+      const nextGarments = [...persistedItems, ...nextExistingItems];
+      const persistedByTemporaryId = new Map(items.map((item, index) => [item.id, persistedItems[index]]));
+      const linkedGarmentIds = new Map<string, { garmentId: string; item: SavedGarment }>();
+      for (const item of appearanceItems) {
+        const garmentId = matchedGarmentIds[item.id] || persistedByTemporaryId.get(item.id)?.id;
+        if (garmentId && !linkedGarmentIds.has(garmentId)) linkedGarmentIds.set(garmentId, { garmentId, item });
+      }
+      if (linkedGarmentIds.size === 0) throw new Error('No hemos podido asociar las prendas al outfit.');
+
+      outfitStoragePath = await uploadOutfitImage(session.user.id, outfit.imageUri);
+      const uploadedOutfitPath = outfitStoragePath;
+      const { data: outfitRow, error: outfitError } = await supabase.from('outfits').insert({
+        user_id: session.user.id,
+        image_path: uploadedOutfitPath,
+        evaluation: outfit.evaluation,
+        taken_at: outfit.createdAt,
+      }).select().single();
+      if (outfitError || !outfitRow) throw new Error(outfitError?.message || 'No hemos podido guardar el outfit.');
+      persistedOutfitId = outfitRow.id;
+      const savedOutfitId = outfitRow.id;
+
+      const outfitLinks = [...linkedGarmentIds.values()].map(({ garmentId, item }) => ({
+        outfit_id: savedOutfitId,
+        garment_id: garmentId,
+        item_box: item.itemBox,
+        display_rotation: item.displayRotation || 0,
+        confidence: item.confidence || 0,
+      }));
+      const { error: linksError } = await supabase.from('outfit_garments').insert(outfitLinks);
+      if (linksError) throw new Error(`No hemos podido guardar las prendas del outfit: ${linksError.message}`);
+
+      const { error: usageError } = await supabase.from('garment_usage_events').insert(
+        outfitLinks.map((link) => ({ user_id: session.user.id, garment_id: link.garment_id, outfit_id: savedOutfitId, used_at: outfit.createdAt })),
+      );
+      if (usageError) console.warn('[Supabase] El outfit se guardó, pero no el registro de uso:', usageError.message);
+
+      const createdOutfit: SavedOutfit = {
+        id: savedOutfitId,
+        imageUri: await signedOutfitUrl(uploadedOutfitPath),
+        storagePath: uploadedOutfitPath,
+        garments: outfitLinks.map((link) => nextGarments.find((item) => item.id === link.garment_id)).filter((item): item is SavedGarment => Boolean(item)),
+        evaluation: outfit.evaluation,
+        createdAt: (outfitRow as DatabaseOutfitRow).taken_at,
+      };
+      setSavedGarments(nextGarments);
+      setSavedOutfits((current) => [createdOutfit, ...current]);
       setWardrobeInitialCategory('todas');
       setTab('armario');
       if (items.length === 0 && wornItemIds.length > 0) {
@@ -1494,6 +1626,8 @@ export default function App() {
       if (wornItemIds.length > 0) messages.push(`Hemos registrado ${wornItemIds.length} ${wornItemIds.length === 1 ? 'nuevo uso' : 'nuevos usos'}.`);
       setNotice({ title: 'Armario guardado', message: messages.join('\n') });
     } catch (error) {
+      if (persistedOutfitId) await supabase.from('outfits').delete().eq('id', persistedOutfitId);
+      if (outfitStoragePath) await supabase.storage.from(OUTFIT_BUCKET).remove([outfitStoragePath]);
       console.error('[Supabase] Error guardando el armario:', error);
       setNotice({ title: 'No hemos podido guardar el armario', message: error instanceof Error ? error.message : 'Comprueba tu conexión e inténtalo de nuevo.' });
       throw error;
@@ -1551,6 +1685,20 @@ export default function App() {
   };
   const deleteOutfit = (id: string) => setSavedOutfits((current) => current.filter((outfit) => outfit.id !== id));
   const restoreOutfit = (outfit: SavedOutfit) => setSavedOutfits((current) => current.some((item) => item.id === outfit.id) ? current : [outfit, ...current]);
+  const deleteOutfitPermanently = async (outfit: SavedOutfit) => {
+    try {
+      const { error } = await supabase.from('outfits').delete().eq('id', outfit.id);
+      if (error) throw error;
+      if (outfit.storagePath) {
+        const { error: storageError } = await supabase.storage.from(OUTFIT_BUCKET).remove([outfit.storagePath]);
+        if (storageError) console.warn('[Supabase] El outfit se eliminó, pero no su foto:', storageError.message);
+      }
+    } catch (error) {
+      console.error('[Supabase] No se pudo eliminar el outfit:', error);
+      setSavedOutfits((current) => current.some((item) => item.id === outfit.id) ? current : [outfit, ...current]);
+      setNotice({ title: 'No hemos podido eliminar el outfit', message: error instanceof Error ? error.message : 'Vuelve a intentarlo.' });
+    }
+  };
   const signOut = async () => {
     const { error } = await supabase.auth.signOut();
     if (error) setNotice({ title: 'No hemos podido cerrar sesión', message: error.message });
@@ -1564,7 +1712,7 @@ export default function App() {
   if (!onboardingCompleted) return <OnboardingScreen initialName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || ''} initialGender={session.user.user_metadata?.gender_identity} initialStyles={session.user.user_metadata?.style_preferences} initialColors={session.user.user_metadata?.color_preferences} initialShops={session.user.user_metadata?.favorite_shops} initialShowOutfitScore={session.user.user_metadata?.show_outfit_score !== false} initialShowImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} onComplete={() => setOnboardingCompleted(true)} />;
   return <NoticeContext.Provider value={{ showNotice: setNotice }}><SafeAreaView style={styles.safe}>
     <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} />
-    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} onOutfitSave={(outfit) => setSavedOutfits((current) => [outfit, ...current])} wardrobeItems={savedGarments} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} /> : <EmptyScreen tab={tab} />}</View>
+    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} wardrobeItems={savedGarments} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} onDeletePermanent={deleteOutfitPermanently} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} /> : <EmptyScreen tab={tab} />}</View>
     {tab !== 'perfil' && <View style={styles.nav}>
       {nav.map((item) => {
         const active = tab === item.key;
