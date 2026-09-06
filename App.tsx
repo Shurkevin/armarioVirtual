@@ -7,6 +7,7 @@ import {
   Animated,
   Easing,
   Image,
+  Linking as NativeLinking,
   Modal,
   PanResponder,
   Platform,
@@ -78,14 +79,14 @@ const nav: { key: Tab; label: string; icon: keyof typeof Feather.glyphMap }[] = 
   { key: 'compras', label: 'Compras', icon: 'shopping-bag' },
 ];
 const FIXED_CATEGORIES = ['ropa superior', 'ropa inferior', 'prenda de cuerpo entero', 'abrigo', 'calzado', 'accesorio'];
-const FIXED_TYPES = ['camiseta', 'camisa', 'polo', 'sudadera', 'suéter', 'jersey', 'chaqueta', 'abrigo', 'pantalón', 'vaquero', 'falda', 'vestido', 'short', 'zapatillas', 'zapatos', 'botas', 'sandalias', 'gafas', 'reloj', 'bolso', 'gorra', 'bufanda', 'cinturón'];
+const FIXED_TYPES = ['camiseta', 'camisa', 'polo', 'sudadera', 'suéter', 'jersey', 'chaqueta', 'abrigo', 'pantalón', 'vaquero', 'falda', 'vestido', 'short', 'zapatillas', 'zapatos', 'botas', 'sandalias', 'reloj', 'bolso', 'gorra', 'bufanda', 'cinturón'];
 const FIXED_TYPES_BY_CATEGORY: Record<string, string[]> = {
   'ropa superior': ['camiseta', 'camisa', 'polo', 'sudadera', 'suéter', 'jersey', 'chaqueta'],
   'ropa inferior': ['pantalón', 'vaquero', 'falda', 'short'],
   'prenda de cuerpo entero': ['vestido', 'mono'],
   abrigo: ['abrigo', 'chaqueta', 'parka', 'gabardina'],
   calzado: ['zapatillas', 'zapatos', 'botas', 'sandalias'],
-  accesorio: ['gafas', 'reloj', 'bolso', 'gorra', 'bufanda', 'cinturón'],
+  accesorio: ['reloj', 'bolso', 'gorra', 'bufanda', 'cinturón'],
 };
 const typesForCategory = (category: string) => FIXED_TYPES_BY_CATEGORY[normalizedValue(category)] || FIXED_TYPES;
 const parsePhotoDate = (value: string | number) => {
@@ -146,7 +147,13 @@ const COLOR_WORD_ALIASES: Record<string, string> = {
   rosada: 'rosa', rosadas: 'rosa', rosado: 'rosa', rosados: 'rosa', rosas: 'rosa',
   marron: 'marrón', marrones: 'marrón', cafe: 'marrón', cafes: 'marrón',
   azules: 'azul', verdes: 'verde', grises: 'gris', naranjas: 'naranja',
-  violetas: 'violeta', turquesas: 'turquesa', granates: 'granate',
+  violetas: 'violeta', lilas: 'lila', turquesas: 'turquesa', granates: 'granate',
+  cremas: 'crema', marfiles: 'marfil', ocres: 'ocre', olivas: 'oliva',
+  corales: 'coral', mostazas: 'mostaza', terracotas: 'terracota',
+  salmon: 'salmón', salmones: 'salmón', aguamarinas: 'aguamarina',
+  cobriza: 'cobrizo', cobrizas: 'cobrizo', cobrizos: 'cobrizo',
+  purpura: 'morado', purpuras: 'morado', purple: 'morado',
+  cyan: 'cian', borgona: 'burdeos', burgundy: 'burdeos',
   kakis: 'caqui', kaki: 'caqui', khaki: 'caqui', khakis: 'caqui', caquis: 'caqui',
   fuchsia: 'fucsia', fuchsias: 'fucsia', fucsias: 'fucsia',
   grey: 'gris', gray: 'gris', navy: 'azul marino',
@@ -716,6 +723,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   const [photoSource, setPhotoSource] = useState<'gallery' | 'camera' | null>(null);
   const [evaluationExpanded, setEvaluationExpanded] = useState(true);
   const [garmentsExpanded, setGarmentsExpanded] = useState(true);
+  const cameraLaunchPending = useRef(false);
 
   const chooseFromGallery = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -758,24 +766,42 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   };
 
   const takePhoto = async () => {
-    const permission = await ImagePicker.requestCameraPermissionsAsync();
-    if (!permission.granted) {
-      showNotice({ title: 'Acceso a la cámara', message: 'Necesitamos permiso para que puedas hacer una foto de tu outfit.' });
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], allowsEditing: false, quality: 0.9, exif: true, cameraType: ImagePicker.CameraType.front });
-    if (!result.canceled && result.assets[0]) {
-      setPhotoSource('camera');
-      const asset = result.assets[0] as ImagePicker.ImagePickerAsset & { exif?: Record<string, unknown> };
-      setImageUri(asset.uri);
-      setImageType(asset.mimeType || 'image/jpeg');
-      setImageSize({ width: asset.width, height: asset.height });
-      const metadataDate = (asset as any).creationTime || asset.exif?.DateTimeOriginal || asset.exif?.DateTimeDigitized || asset.exif?.DateTime;
-      setPhotoDate(metadataDate ? parsePhotoDate(metadataDate as string | number) : new Date().toISOString());
-      setAskForPhotoDate(false);
-      setManualPhotoDate('');
-      setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); setOutfitEvaluation(null); setYoungChildDetected(false); setStage('upload');
-      setNoOutfitFound(false);
+    if (cameraLaunchPending.current) return;
+    cameraLaunchPending.current = true;
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        showNotice({
+          title: 'Acceso a la cámara',
+          message: permission.canAskAgain
+            ? 'Necesitamos permiso para que puedas hacer una foto de tu outfit.'
+            : 'El permiso de cámara está bloqueado. Actívalo desde los ajustes de Armario.',
+          actions: permission.canAskAgain ? undefined : [
+            { label: 'Cancelar' },
+            { label: 'Abrir ajustes', onPress: () => void NativeLinking.openSettings() },
+          ],
+        });
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], allowsEditing: false, quality: 0.9, exif: true, cameraType: ImagePicker.CameraType.front });
+      if (!result.canceled && result.assets[0]) {
+        setPhotoSource('camera');
+        const asset = result.assets[0] as ImagePicker.ImagePickerAsset & { exif?: Record<string, unknown> };
+        setImageUri(asset.uri);
+        setImageType(asset.mimeType || 'image/jpeg');
+        setImageSize({ width: asset.width, height: asset.height });
+        const metadataDate = (asset as any).creationTime || asset.exif?.DateTimeOriginal || asset.exif?.DateTimeDigitized || asset.exif?.DateTime;
+        setPhotoDate(metadataDate ? parsePhotoDate(metadataDate as string | number) : new Date().toISOString());
+        setAskForPhotoDate(false);
+        setManualPhotoDate('');
+        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); setOutfitEvaluation(null); setYoungChildDetected(false); setStage('upload');
+        setNoOutfitFound(false);
+      }
+    } catch (error) {
+      console.error('[Cámara] No se pudo abrir:', error);
+      showNotice({ title: 'No hemos podido abrir la cámara', message: 'Comprueba que Armario tiene permiso de cámara e inténtalo de nuevo.' });
+    } finally {
+      cameraLaunchPending.current = false;
     }
   };
 

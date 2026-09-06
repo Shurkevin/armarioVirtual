@@ -47,7 +47,13 @@ const COLOR_WORD_ALIASES = {
   rosada: 'rosa', rosadas: 'rosa', rosado: 'rosa', rosados: 'rosa', rosas: 'rosa',
   marron: 'marrón', marrones: 'marrón', cafe: 'marrón', cafes: 'marrón',
   azules: 'azul', verdes: 'verde', grises: 'gris', naranjas: 'naranja',
-  violetas: 'violeta', turquesas: 'turquesa', granates: 'granate',
+  violetas: 'violeta', lilas: 'lila', turquesas: 'turquesa', granates: 'granate',
+  cremas: 'crema', marfiles: 'marfil', ocres: 'ocre', olivas: 'oliva',
+  corales: 'coral', mostazas: 'mostaza', terracotas: 'terracota',
+  salmon: 'salmón', salmones: 'salmón', aguamarinas: 'aguamarina',
+  cobriza: 'cobrizo', cobrizas: 'cobrizo', cobrizos: 'cobrizo',
+  purpura: 'morado', purpuras: 'morado', purple: 'morado',
+  cyan: 'cian', borgona: 'burdeos', burgundy: 'burdeos',
   kakis: 'caqui', kaki: 'caqui', khaki: 'caqui', khakis: 'caqui', caquis: 'caqui',
   fuchsia: 'fucsia', fuchsias: 'fucsia', fucsias: 'fucsia',
   grey: 'gris', gray: 'gris', navy: 'azul marino',
@@ -64,9 +70,12 @@ const isFootwear = (item) => {
   const description = `${normalizedText(item.category)} ${normalizedText(item.subcategory)}`;
   return ['calzado', 'zapatill', 'zapato', 'bota', 'sandalia', 'mocasin', 'mocasín', 'tacon', 'tacón'].some((term) => description.includes(term));
 };
-const isExcludedAudioAccessory = (item) => {
+const isExcludedWardrobeItem = (item) => {
   const description = normalizedText(`${item.category || ''} ${item.subcategory || ''}`);
-  return ['auricular', 'audifono', 'audífono', 'headphone', 'earphone', 'earbud', 'airpod', 'cascos de audio'].some((term) => description.includes(term));
+  return [
+    'auricular', 'audifono', 'audífono', 'headphone', 'earphone', 'earbud', 'airpod', 'cascos de audio',
+    'gafas', 'anteojos', 'lentes', 'glasses', 'sunglasses', 'eyewear',
+  ].some((term) => description.includes(term));
 };
 const footwearKind = (item) => {
   const description = normalizedText(item.subcategory);
@@ -98,65 +107,6 @@ const mergeFootwearPairs = (items = []) => {
     match.materialConfidence = Math.max(match.materialConfidence, item.materialConfidence);
   }
   return merged;
-};
-const applyObjectDisplayRotation = (item) => {
-  const description = normalizedText(`${item.category} ${item.subcategory}`);
-  const modelDisplayRotation = item.displayRotation;
-  const isGlasses = ['gafas', 'anteojos', 'lentes de sol'].some((term) => description.includes(term));
-  if (isGlasses) {
-    const boxWidth = item.itemBox.xMax - item.itemBox.xMin;
-    const boxHeight = item.itemBox.yMax - item.itemBox.yMin;
-    if (boxHeight > boxWidth * 1.15) item.displayRotation = 0;
-    else if (boxWidth > boxHeight * 1.15) item.displayRotation = 0;
-  }
-  item.modelDisplayRotation = modelDisplayRotation;
-  return item;
-};
-const needsGlassesOrientationCheck = (item) => {
-  const description = normalizedText(`${item.category} ${item.subcategory}`);
-  const isGlasses = ['gafas', 'anteojos', 'lentes de sol'].some((term) => description.includes(term));
-  return isGlasses && (item.itemBox.yMax - item.itemBox.yMin) > (item.itemBox.xMax - item.itemBox.xMin) * 1.15;
-};
-const resolveGlassesRotation = async ({ image, mimeType, item, model, apiKey, log }) => {
-  const box = item.itemBox;
-  log(`Comprobando el sentido correcto del giro para ${item.subcategory || item.category}…`);
-  const startedAt = Date.now();
-  const waitingLog = setInterval(() => log(`Gemini sigue evaluando la orientación del objeto… ${Math.round((Date.now() - startedAt) / 1000)} s.`), 5000);
-  try {
-    const geminiResponse = await fetchGeminiWithRetry({
-      url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      options: {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify({
-        contents: [{ role: 'user', parts: [
-          { text: `Evalúa exclusivamente las gafas contenidas en la caja normalizada xMin=${box.xMin}, yMin=${box.yMin}, xMax=${box.xMax}, yMax=${box.yMax}. El objeto está vertical y debe quedar horizontal. Ignora por completo la persona, la postura, el fondo y cualquier texto que haya detrás. Escoge 90 o 270 grados en sentido horario según cuál deje las gafas del derecho en una presentación de catálogo: montura superior arriba, parte inferior de las lentes abajo y patillas en orientación natural.` },
-          { inlineData: { mimeType, data: image.toString('base64') } },
-        ] }],
-        generationConfig: {
-          thinkingConfig: { thinkingLevel: 'minimal' },
-          maxOutputTokens: 64,
-          responseMimeType: 'application/json',
-          responseJsonSchema: {
-            type: 'object', additionalProperties: false,
-            properties: { rotation: { type: 'integer', enum: [90, 270] } },
-            required: ['rotation'],
-          },
-        },
-        }),
-      },
-      log,
-    });
-    const result = await geminiResponse.json();
-    if (!geminiResponse.ok) throw new Error(result?.error?.message || 'Error de Gemini al orientar el objeto.');
-    const outputText = result?.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text;
-    const rotation = JSON.parse(outputText || '{}').rotation;
-    if (![90, 270].includes(rotation)) throw new Error('Gemini no devolvió un giro válido.');
-    log(`Orientación específica del objeto resuelta en ${Date.now() - startedAt} ms: ${rotation}°.`);
-    return rotation;
-  } finally {
-    clearInterval(waitingLog);
-  }
 };
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -308,7 +258,7 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
         contents: [{
           role: 'user',
           parts: [
-            { text: 'No incluyas auriculares, cascos de audio, earbuds, AirPods ni ningún otro dispositivo de sonido entre las prendas o accesorios.' },
+            { text: 'No incluyas gafas, gafas de sol, anteojos, lentes ni ningún tipo de eyewear entre las prendas o accesorios. Tampoco incluyas auriculares, cascos de audio, earbuds, AirPods ni ningún otro dispositivo de sonido.' },
             { text: 'No tengas en cuenta bebés ni niños muy pequeños: no los devuelvas como personas seleccionables, no enumeres sus prendas y no confundas su ropa o accesorios con los de los adultos que aparecen en la foto. Si hay al menos uno claramente visible, establece youngChildDetected en true; úsalo únicamente como señal de exclusión, sin estimar edades ni describir al menor.' },
             { text: 'En la valoración del outfit usa un criterio positivo y ligeramente más generoso: un conjunto bien coordinado y apropiado puede estar en 80-89; reserva 90-94 para conjuntos especialmente logrados y 95-100 solo para resultados excepcionales. Usa notas inferiores a 70 únicamente si hay problemas visuales claros y relevantes.' },
             { text: 'Detecta las personas visibles y valora para cada una foregroundSubject y prominence entre 0 y 1. Ordénalas de izquierda a derecha y asigna ids consecutivos empezando por 1. Describe su posición brevemente sin usar rasgos personales. Indica si su cara es visible y devuelve faceBox con xMin, yMin, xMax e yMax entre 0 y 1000; si no es visible usa ceros. Para cada persona enumera las prendas y accesorios que lleva y genera outfitEvaluation: una valoración breve y amable basada solo en lo visible del conjunto (coordinación de colores, equilibrio, ocasión y acabado), con score de 0 a 100, summary, 1-3 strengths, 1-3 improvements y 1-3 suggestions accionables de vestimenta que harían que el conjunto combinase o se viera mejor. Usa una escala exigente y amplia: 50-59 es un conjunto correcto pero con varios aspectos visuales mejorables; 60-69 es bueno; 70-79 muy bueno; 80-89 excelente y coherente; 90-94 sobresaliente; reserva 95-100 para estilismos excepcionales, impecables y especialmente memorables. No concentres las puntuaciones entre 80 y 88: penaliza de forma proporcionada incompatibilidades de color, proporción, formalidad, acabado o falta de intención estilística. Las mejoras deben ser exclusivamente estéticas y de styling: no recomiendes prendas por el clima, comodidad, protección, utilidad, seguridad ni planes hipotéticos (por ejemplo, no sugieras añadir una chaqueta por si cambia el tiempo). No juzgues el cuerpo, atractivo, género, edad ni rasgos personales, y no inventes prendas que no se vean. Para cada prenda devuelve itemBox, un rectángulo lo más ajustado posible con xMin, yMin, xMax e yMax entre 0 y 1000. Incluye categoría, subcategoría, color principal, colores secundarios, estilos, estampado, marca claramente visible en brand (o cadena vacía), composición aparente en materialEstimate, tipo de construcción en fabricType, textura visible en texture, confianza específica del material entre 0 y 1 y confianza general entre 0 y 1. En el color sé preciso y descriptivo. Usa nombres canónicos en español, en singular y forma base: “beige” (no “beis”), “marrón” (no “café”), “rosa” (no “rosado”), “caqui” (no “kaki” ni “khaki”) y “fucsia” (no “fuchsia”). Conserva matices como claro, oscuro, pastel o marino. El color principal debe incluir la combinación cuando la prenda tenga varios colores visibles (por ejemplo, “blanco y negro” para una camisa de rayas blancas y negras), colores secundarios debe listar todos los colores claramente apreciables y su orden no importa. No uses solo el color dominante ni omitas rayas, cuadros, bloques o estampados bicolor; si un color ocupa una parte relevante, inclúyelo aunque sea secundario.' },
@@ -439,41 +389,19 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     const ignoredPeopleCount = detectedPeople.length - analysis.people.length;
     if (ignoredPeopleCount > 0) log(`${ignoredPeopleCount} personas incidentales del fondo ignoradas.`);
     let mergedFootwearCount = 0;
-    let excludedAudioCount = 0;
+    let excludedItemCount = 0;
     analysis.people = analysis.people.map((person) => {
       const originalCount = person.items?.length || 0;
       const wardrobeItems = (person.items || [])
-        .filter((item) => !isExcludedAudioAccessory(item))
+        .filter((item) => !isExcludedWardrobeItem(item))
         .map(normalizeGarmentColors);
-      excludedAudioCount += originalCount - wardrobeItems.length;
-      const items = mergeFootwearPairs(wardrobeItems).map(applyObjectDisplayRotation);
+      excludedItemCount += originalCount - wardrobeItems.length;
+      const items = mergeFootwearPairs(wardrobeItems);
       mergedFootwearCount += wardrobeItems.length - items.length;
       return { ...person, items };
     });
-    if (excludedAudioCount > 0) log(`${excludedAudioCount} dispositivos de audio excluidos del armario.`);
+    if (excludedItemCount > 0) log(`${excludedItemCount} elementos excluidos del armario (gafas o dispositivos de audio).`);
     if (mergedFootwearCount > 0) log(`${mergedFootwearCount} duplicados de calzado fusionados como pares.`);
-    for (const person of analysis.people) {
-      for (const item of person.items || []) {
-        if (needsGlassesOrientationCheck(item)) {
-          try {
-            item.displayRotation = await resolveGlassesRotation({
-              image: request.file.buffer,
-              mimeType: request.file.mimetype,
-              item,
-              model,
-              apiKey: process.env.GEMINI_API_KEY,
-              log,
-            });
-          } catch (orientationError) {
-            item.displayRotation = 0;
-            log(`No se pudo resolver con seguridad el sentido del giro de ${item.subcategory || item.category}; no se aplicará una rotación automática.`);
-          }
-        }
-        const boxWidth = Math.round(item.itemBox.xMax - item.itemBox.xMin);
-        const boxHeight = Math.round(item.itemBox.yMax - item.itemBox.yMin);
-        log(`Orientación del objeto: persona ${person.id}, ${item.subcategory || item.category}, Gemini=${item.modelDisplayRotation}°, aplicada=${item.displayRotation}°, caja=${boxWidth}x${boxHeight}.`);
-      }
-    }
     const garmentCount = analysis.people?.reduce((total, person) => total + (person.items?.length || 0), 0) || 0;
     log(`Análisis completado: ${analysis.people?.length || 0} personas y ${garmentCount} prendas detectadas en ${Date.now() - startedAt} ms.`);
     response.json({ ...analysis, _analysisMeta: analysisMeta() });

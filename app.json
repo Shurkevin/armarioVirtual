@@ -19,7 +19,7 @@
         "backgroundColor": "#201D1A"
       },
       "permissions": [
-        "android.permission.RECORD_AUDIO"
+        "android.permission.CAMERA"
       ]
     },
     "ios": {
@@ -30,7 +30,8 @@
         "expo-image-picker",
         {
           "photosPermission": "Armario necesita acceder a tus fotos para que puedas añadir tus outfits.",
-          "cameraPermission": false
+          "cameraPermission": "Armario necesita acceder a la cámara para que puedas fotografiar tus outfits.",
+          "microphonePermission": false
         }
       ]
     ],
