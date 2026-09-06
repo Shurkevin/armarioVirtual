@@ -34,6 +34,32 @@ const fetchGeminiWithRetry = async ({ url, options, log }) => {
   throw lastNetworkError || new Error('Gemini no ha respondido tras varios intentos.');
 };
 const normalizedText = (value = '') => value.trim().toLocaleLowerCase('es');
+const normalizedWord = (value = '') => value.toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const COLOR_WORD_ALIASES = {
+  beis: 'beige', beises: 'beige', beiges: 'beige',
+  blanca: 'blanco', blancas: 'blanco', blancos: 'blanco',
+  negra: 'negro', negras: 'negro', negros: 'negro',
+  roja: 'rojo', rojas: 'rojo', rojos: 'rojo',
+  amarilla: 'amarillo', amarillas: 'amarillo', amarillos: 'amarillo',
+  morada: 'morado', moradas: 'morado', morados: 'morado',
+  dorada: 'dorado', doradas: 'dorado', dorados: 'dorado',
+  plateada: 'plateado', plateadas: 'plateado', plateados: 'plateado',
+  rosada: 'rosa', rosadas: 'rosa', rosado: 'rosa', rosados: 'rosa', rosas: 'rosa',
+  marron: 'marrón', marrones: 'marrón', cafe: 'marrón', cafes: 'marrón',
+  azules: 'azul', verdes: 'verde', grises: 'gris', naranjas: 'naranja',
+  violetas: 'violeta', turquesas: 'turquesa', granates: 'granate',
+  kakis: 'caqui', kaki: 'caqui', khaki: 'caqui', khakis: 'caqui', caquis: 'caqui',
+  fuchsia: 'fucsia', fuchsias: 'fucsia', fucsias: 'fucsia',
+  grey: 'gris', gray: 'gris', navy: 'azul marino',
+};
+const canonicalColor = (value = '') => typeof value === 'string'
+  ? value.trim().toLocaleLowerCase('es').replace(/[\p{L}]+/gu, (word) => COLOR_WORD_ALIASES[normalizedWord(word)] || word)
+  : '';
+const normalizeGarmentColors = (item) => ({
+  ...item,
+  primaryColor: canonicalColor(item.primaryColor),
+  secondaryColors: (item.secondaryColors || []).map(canonicalColor),
+});
 const isFootwear = (item) => {
   const description = `${normalizedText(item.category)} ${normalizedText(item.subcategory)}`;
   return ['calzado', 'zapatill', 'zapato', 'bota', 'sandalia', 'mocasin', 'mocasín', 'tacon', 'tacón'].some((term) => description.includes(term));
@@ -232,24 +258,35 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
 app.post('/analyze-outfit', upload.single('photo'), async (request, response) => {
   const requestId = randomUUID().slice(0, 8);
   const startedAt = Date.now();
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  let providerStartedAt;
+  let providerDurationMs;
   const log = (message) => console.log(`[${new Date().toISOString()}] [${requestId}] ${message}`);
+  const analysisMeta = () => ({
+    requestId,
+    model,
+    serverDurationMs: Date.now() - startedAt,
+    providerDurationMs: providerDurationMs
+      ?? (providerStartedAt ? Date.now() - providerStartedAt : null),
+  });
+  const sendError = (status, error) => response.status(status).json({ error, _analysisMeta: analysisMeta() });
 
   log('Nueva solicitud de análisis.');
   if (!request.file) {
     log('Solicitud rechazada: no contiene una foto.');
-    return response.status(400).json({ error: 'Falta la foto.' });
+    return sendError(400, 'Falta la foto.');
   }
   log(`Foto recibida: ${request.file.mimetype}, ${(request.file.size / 1024 / 1024).toFixed(2)} MB.`);
 
   if (!process.env.GEMINI_API_KEY) {
     log('Solicitud rechazada: GEMINI_API_KEY no está configurada.');
-    return response.status(503).json({ error: 'El servidor no tiene configurada GEMINI_API_KEY.' });
+    return sendError(503, 'El servidor no tiene configurada GEMINI_API_KEY.');
   }
 
   try {
-    const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
     log(`Enviando la imagen a Gemini (${model})…`);
     const geminiStartedAt = Date.now();
+    providerStartedAt = geminiStartedAt;
     const waitingLog = setInterval(() => {
       const waitingSeconds = Math.round((Date.now() - geminiStartedAt) / 1000);
       log(`Gemini sigue procesando la imagen… ${waitingSeconds} s de espera.`);
@@ -274,7 +311,7 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
             { text: 'No incluyas auriculares, cascos de audio, earbuds, AirPods ni ningún otro dispositivo de sonido entre las prendas o accesorios.' },
             { text: 'No tengas en cuenta bebés ni niños muy pequeños: no los devuelvas como personas seleccionables, no enumeres sus prendas y no confundas su ropa o accesorios con los de los adultos que aparecen en la foto. Si hay al menos uno claramente visible, establece youngChildDetected en true; úsalo únicamente como señal de exclusión, sin estimar edades ni describir al menor.' },
             { text: 'En la valoración del outfit usa un criterio positivo y ligeramente más generoso: un conjunto bien coordinado y apropiado puede estar en 80-89; reserva 90-94 para conjuntos especialmente logrados y 95-100 solo para resultados excepcionales. Usa notas inferiores a 70 únicamente si hay problemas visuales claros y relevantes.' },
-            { text: 'Detecta las personas visibles y valora para cada una foregroundSubject y prominence entre 0 y 1. Ordénalas de izquierda a derecha y asigna ids consecutivos empezando por 1. Describe su posición brevemente sin usar rasgos personales. Indica si su cara es visible y devuelve faceBox con xMin, yMin, xMax e yMax entre 0 y 1000; si no es visible usa ceros. Para cada persona enumera las prendas y accesorios que lleva y genera outfitEvaluation: una valoración breve y amable basada solo en lo visible del conjunto (coordinación de colores, equilibrio, ocasión y acabado), con score de 0 a 100, summary, 1-3 strengths, 1-3 improvements y 1-3 suggestions accionables de vestimenta que harían que el conjunto combinase o se viera mejor. Usa una escala exigente y amplia: 50-59 es un conjunto correcto pero con varios aspectos visuales mejorables; 60-69 es bueno; 70-79 muy bueno; 80-89 excelente y coherente; 90-94 sobresaliente; reserva 95-100 para estilismos excepcionales, impecables y especialmente memorables. No concentres las puntuaciones entre 80 y 88: penaliza de forma proporcionada incompatibilidades de color, proporción, formalidad, acabado o falta de intención estilística. Las mejoras deben ser exclusivamente estéticas y de styling: no recomiendes prendas por el clima, comodidad, protección, utilidad, seguridad ni planes hipotéticos (por ejemplo, no sugieras añadir una chaqueta por si cambia el tiempo). No juzgues el cuerpo, atractivo, género, edad ni rasgos personales, y no inventes prendas que no se vean. Para cada prenda devuelve itemBox, un rectángulo lo más ajustado posible con xMin, yMin, xMax e yMax entre 0 y 1000. Incluye categoría, subcategoría, color principal, colores secundarios, estilos, estampado, marca claramente visible en brand (o cadena vacía), composición aparente en materialEstimate, tipo de construcción en fabricType, textura visible en texture, confianza específica del material entre 0 y 1 y confianza general entre 0 y 1. En el color sé preciso y descriptivo: color principal debe incluir la combinación cuando la prenda tenga varios colores visibles (por ejemplo, “blanco y negro” para una camisa de rayas blancas y negras), colores secundarios debe listar todos los colores claramente apreciables y su orden no importa. No uses solo el color dominante ni omitas rayas, cuadros, bloques o estampados bicolor; si un color ocupa una parte relevante, inclúyelo aunque sea secundario.' },
+            { text: 'Detecta las personas visibles y valora para cada una foregroundSubject y prominence entre 0 y 1. Ordénalas de izquierda a derecha y asigna ids consecutivos empezando por 1. Describe su posición brevemente sin usar rasgos personales. Indica si su cara es visible y devuelve faceBox con xMin, yMin, xMax e yMax entre 0 y 1000; si no es visible usa ceros. Para cada persona enumera las prendas y accesorios que lleva y genera outfitEvaluation: una valoración breve y amable basada solo en lo visible del conjunto (coordinación de colores, equilibrio, ocasión y acabado), con score de 0 a 100, summary, 1-3 strengths, 1-3 improvements y 1-3 suggestions accionables de vestimenta que harían que el conjunto combinase o se viera mejor. Usa una escala exigente y amplia: 50-59 es un conjunto correcto pero con varios aspectos visuales mejorables; 60-69 es bueno; 70-79 muy bueno; 80-89 excelente y coherente; 90-94 sobresaliente; reserva 95-100 para estilismos excepcionales, impecables y especialmente memorables. No concentres las puntuaciones entre 80 y 88: penaliza de forma proporcionada incompatibilidades de color, proporción, formalidad, acabado o falta de intención estilística. Las mejoras deben ser exclusivamente estéticas y de styling: no recomiendes prendas por el clima, comodidad, protección, utilidad, seguridad ni planes hipotéticos (por ejemplo, no sugieras añadir una chaqueta por si cambia el tiempo). No juzgues el cuerpo, atractivo, género, edad ni rasgos personales, y no inventes prendas que no se vean. Para cada prenda devuelve itemBox, un rectángulo lo más ajustado posible con xMin, yMin, xMax e yMax entre 0 y 1000. Incluye categoría, subcategoría, color principal, colores secundarios, estilos, estampado, marca claramente visible en brand (o cadena vacía), composición aparente en materialEstimate, tipo de construcción en fabricType, textura visible en texture, confianza específica del material entre 0 y 1 y confianza general entre 0 y 1. En el color sé preciso y descriptivo. Usa nombres canónicos en español, en singular y forma base: “beige” (no “beis”), “marrón” (no “café”), “rosa” (no “rosado”), “caqui” (no “kaki” ni “khaki”) y “fucsia” (no “fuchsia”). Conserva matices como claro, oscuro, pastel o marino. El color principal debe incluir la combinación cuando la prenda tenga varios colores visibles (por ejemplo, “blanco y negro” para una camisa de rayas blancas y negras), colores secundarios debe listar todos los colores claramente apreciables y su orden no importa. No uses solo el color dominante ni omitas rayas, cuadros, bloques o estampados bicolor; si un color ocupa una parte relevante, inclúyelo aunque sea secundario.' },
             { inlineData: { mimeType: request.file.mimetype, data: request.file.buffer.toString('base64') } },
           ],
         }],
@@ -373,6 +410,7 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     log(`Cabeceras recibidas de Gemini: HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
     const responseBodyStartedAt = Date.now();
     const result = await geminiResponse.json();
+    providerDurationMs = Date.now() - geminiStartedAt;
     log(`Respuesta de Gemini descargada y parseada en ${Date.now() - responseBodyStartedAt} ms.`);
     if (!geminiResponse.ok) {
       const providerError = new Error(result?.error?.message || 'Error de Gemini');
@@ -404,7 +442,9 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     let excludedAudioCount = 0;
     analysis.people = analysis.people.map((person) => {
       const originalCount = person.items?.length || 0;
-      const wardrobeItems = (person.items || []).filter((item) => !isExcludedAudioAccessory(item));
+      const wardrobeItems = (person.items || [])
+        .filter((item) => !isExcludedAudioAccessory(item))
+        .map(normalizeGarmentColors);
       excludedAudioCount += originalCount - wardrobeItems.length;
       const items = mergeFootwearPairs(wardrobeItems).map(applyObjectDisplayRotation);
       mergedFootwearCount += wardrobeItems.length - items.length;
@@ -436,28 +476,22 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     }
     const garmentCount = analysis.people?.reduce((total, person) => total + (person.items?.length || 0), 0) || 0;
     log(`Análisis completado: ${analysis.people?.length || 0} personas y ${garmentCount} prendas detectadas en ${Date.now() - startedAt} ms.`);
-    response.json(analysis);
+    response.json({ ...analysis, _analysisMeta: analysisMeta() });
   } catch (error) {
     console.error(`[${new Date().toISOString()}] [${requestId}] Error tras ${Date.now() - startedAt} ms:`, error?.message || error);
     if (error?.status === 503) {
-      return response.status(503).json({
-        error: 'Gemini está temporalmente saturado. Hemos reintentado el análisis varias veces; prueba de nuevo en un momento.',
-      });
+      return sendError(503, 'Gemini está temporalmente saturado. Hemos reintentado el análisis varias veces; prueba de nuevo en un momento.');
     }
     if (error?.status === 429) {
-      return response.status(429).json({
-        error: 'Has alcanzado temporalmente el límite gratuito de Gemini. Espera un poco y vuelve a intentarlo.',
-      });
+      return sendError(429, 'Has alcanzado temporalmente el límite gratuito de Gemini. Espera un poco y vuelve a intentarlo.');
     }
     if (error?.status === 404) {
-      return response.status(502).json({
-        error: 'El modelo de análisis ya no está disponible. Actualiza GEMINI_MODEL en el servidor.',
-      });
+      return sendError(502, 'El modelo de análisis ya no está disponible. Actualiza GEMINI_MODEL en el servidor.');
     }
     if (error?.status === 422) {
-      return response.status(422).json({ error: error.message });
+      return sendError(422, error.message);
     }
-    response.status(502).json({ error: 'No se ha podido analizar la imagen.' });
+    sendError(502, 'No se ha podido analizar la imagen.');
   }
 });
 

@@ -55,14 +55,32 @@ create table if not exists public.garment_usage_events (
   used_at timestamptz not null default now()
 );
 
+create table if not exists public.analysis_runs (
+  id bigint generated always as identity primary key,
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  analysis_type text not null default 'outfit',
+  status text not null check (status in ('completed', 'failed')),
+  client_duration_ms integer not null check (client_duration_ms >= 0),
+  server_duration_ms integer check (server_duration_ms >= 0),
+  provider_duration_ms integer check (provider_duration_ms >= 0),
+  http_status integer check (http_status between 100 and 599),
+  people_count integer check (people_count >= 0),
+  garment_count integer check (garment_count >= 0),
+  model text,
+  request_id text,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists garments_user_id_idx on public.garments(user_id);
 create index if not exists outfits_user_id_idx on public.outfits(user_id);
 create index if not exists usage_garment_id_idx on public.garment_usage_events(garment_id);
+create index if not exists analysis_runs_user_created_idx on public.analysis_runs(user_id, created_at desc);
 
 alter table public.garments enable row level security;
 alter table public.outfits enable row level security;
 alter table public.outfit_garments enable row level security;
 alter table public.garment_usage_events enable row level security;
+alter table public.analysis_runs enable row level security;
 
 create policy "Users manage their garments" on public.garments
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
@@ -73,3 +91,7 @@ create policy "Users manage outfit garments" on public.outfit_garments
   with check (exists (select 1 from public.outfits o where o.id = outfit_id and o.user_id = auth.uid()));
 create policy "Users manage their usage events" on public.garment_usage_events
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "Users insert their analysis runs" on public.analysis_runs
+  for insert with check (auth.uid() = user_id);
+create policy "Users read their analysis runs" on public.analysis_runs
+  for select using (auth.uid() = user_id);

@@ -53,6 +53,7 @@ type Garment = {
 type FaceBox = { xMin: number; yMin: number; xMax: number; yMax: number };
 type OutfitEvaluation = { score: number; summary: string; strengths: string[]; improvements: string[]; suggestions: string[] };
 type PersonAnalysis = { id: number; position: string; faceVisible: boolean; faceBox: FaceBox; items: Garment[]; outfitEvaluation?: OutfitEvaluation };
+type AnalysisMeta = { requestId?: string; model?: string; serverDurationMs?: number; providerDurationMs?: number | null };
 type GarmentFingerprint = Pick<Garment, 'category' | 'subcategory' | 'primaryColor' | 'brand' | 'pattern' | 'fabricType' | 'styles'>;
 type SavedGarment = Garment & { id: string; imageUri: string; storagePath?: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
 type DuplicateMatch = { candidateId: string; candidate: SavedGarment; saved: SavedGarment; bestImage: 'candidate' | 'saved' };
@@ -133,8 +134,32 @@ const normalizedCategory = (category: string) => {
 };
 
 const normalizedValue = (value = '') => value.trim().toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const COLOR_WORD_ALIASES: Record<string, string> = {
+  beis: 'beige', beises: 'beige', beiges: 'beige',
+  blanca: 'blanco', blancas: 'blanco', blancos: 'blanco',
+  negra: 'negro', negras: 'negro', negros: 'negro',
+  roja: 'rojo', rojas: 'rojo', rojos: 'rojo',
+  amarilla: 'amarillo', amarillas: 'amarillo', amarillos: 'amarillo',
+  morada: 'morado', moradas: 'morado', morados: 'morado',
+  dorada: 'dorado', doradas: 'dorado', dorados: 'dorado',
+  plateada: 'plateado', plateadas: 'plateado', plateados: 'plateado',
+  rosada: 'rosa', rosadas: 'rosa', rosado: 'rosa', rosados: 'rosa', rosas: 'rosa',
+  marron: 'marrón', marrones: 'marrón', cafe: 'marrón', cafes: 'marrón',
+  azules: 'azul', verdes: 'verde', grises: 'gris', naranjas: 'naranja',
+  violetas: 'violeta', turquesas: 'turquesa', granates: 'granate',
+  kakis: 'caqui', kaki: 'caqui', khaki: 'caqui', khakis: 'caqui', caquis: 'caqui',
+  fuchsia: 'fucsia', fuchsias: 'fucsia', fucsias: 'fucsia',
+  grey: 'gris', gray: 'gris', navy: 'azul marino',
+};
+const canonicalColor = (value = '') => value.trim().toLocaleLowerCase('es').replace(/[\p{L}]+/gu, (word) => COLOR_WORD_ALIASES[normalizedValue(word)] || word);
+const normalizedColorValue = (value = '') => normalizedValue(canonicalColor(value));
+const canonicalizeGarmentColors = (item: Garment): Garment => ({
+  ...item,
+  primaryColor: canonicalColor(item.primaryColor),
+  secondaryColors: (item.secondaryColors || []).map(canonicalColor),
+});
 const colorFamily = (value = '') => {
-  const color = normalizedValue(value);
+  const color = normalizedColorValue(value);
   const families: [string, string[]][] = [
     ['blanco', ['blanco', 'blanca', 'blancos', 'blancas', 'blanco roto', 'blanca rota', 'crudo', 'cruda', 'marfil', 'crema']],
     ['negro', ['negro', 'negra', 'negros', 'negras', 'antracita']],
@@ -157,7 +182,7 @@ const duplicateScore = (candidate: Garment, saved: SavedGarment) => {
   if (exactType) score += 0.4;
   else if (garmentKind(candidate) === garmentKind(savedIdentity)) score += 0.3;
   if (normalizedCategory(candidate.category).key === normalizedCategory(savedIdentity.category).key) score += 0.15;
-  if (normalizedValue(candidate.primaryColor) === normalizedValue(savedIdentity.primaryColor)) score += 0.2;
+  if (normalizedColorValue(candidate.primaryColor) === normalizedColorValue(savedIdentity.primaryColor)) score += 0.2;
   else if (colorFamily(candidate.primaryColor) === colorFamily(savedIdentity.primaryColor)) score += 0.15;
   const candidateColors = colorFamilies(candidate);
   const savedColors = colorFamilies(savedIdentity);
@@ -178,14 +203,17 @@ const hasUsefulValue = (value = '') => {
 };
 const keepBestValue = (savedValue: string, candidateValue: string) => hasUsefulValue(savedValue) ? savedValue : candidateValue;
 const unionValues = (first: string[], second: string[]) => Array.from(new Map([...first, ...second].filter(Boolean).map((value) => [normalizedValue(value), value])).values());
+const unionColors = (first: string[], second: string[]) => Array.from(new Map([...first, ...second]
+  .filter(Boolean)
+  .map((value) => [normalizedColorValue(value), canonicalColor(value)])).values());
 const mergeScans = (saved: SavedGarment, candidate: SavedGarment, bestImage: 'candidate' | 'saved'): SavedGarment => {
   const bestPhoto = bestImage === 'candidate' ? candidate : saved;
   return {
     ...saved,
     category: keepBestValue(saved.category, candidate.category),
     subcategory: keepBestValue(saved.subcategory, candidate.subcategory),
-    primaryColor: keepBestValue(saved.primaryColor, candidate.primaryColor),
-    secondaryColors: unionValues(saved.secondaryColors, [candidate.primaryColor, ...candidate.secondaryColors].filter((color) => normalizedValue(color) !== normalizedValue(saved.primaryColor))),
+    primaryColor: canonicalColor(keepBestValue(saved.primaryColor, candidate.primaryColor)),
+    secondaryColors: unionColors(saved.secondaryColors, [candidate.primaryColor, ...candidate.secondaryColors].filter((color) => normalizedColorValue(color) !== normalizedColorValue(saved.primaryColor))),
     styles: unionValues(saved.styles, candidate.styles),
     pattern: keepBestValue(saved.pattern, candidate.pattern),
     brand: keepBestValue(saved.brand, candidate.brand),
@@ -249,8 +277,8 @@ const garmentPayload = (item: SavedGarment, imagePath: string) => ({
   custom_name: item.customName?.trim() || null,
   category: item.category || '',
   subcategory: item.subcategory || '',
-  primary_color: item.primaryColor || '',
-  secondary_colors: item.secondaryColors || [],
+  primary_color: canonicalColor(item.primaryColor),
+  secondary_colors: (item.secondaryColors || []).map(canonicalColor),
   styles: item.styles || [],
   pattern: item.pattern || '',
   brand: item.brand || '',
@@ -261,7 +289,9 @@ const garmentPayload = (item: SavedGarment, imagePath: string) => ({
   confidence: item.confidence || 0,
   image_path: imagePath,
   wear_count: item.wearCount || 1,
-  scan_fingerprint: item.scanFingerprint || null,
+  scan_fingerprint: item.scanFingerprint
+    ? { ...item.scanFingerprint, primaryColor: canonicalColor(item.scanFingerprint.primaryColor) }
+    : null,
 });
 
 const rowToSavedGarment = (row: DatabaseGarmentRow, imageUri: string): SavedGarment => ({
@@ -272,8 +302,8 @@ const rowToSavedGarment = (row: DatabaseGarmentRow, imageUri: string): SavedGarm
   customName: row.custom_name || undefined,
   category: row.category,
   subcategory: row.subcategory,
-  primaryColor: row.primary_color,
-  secondaryColors: toStringArray(row.secondary_colors),
+  primaryColor: canonicalColor(row.primary_color),
+  secondaryColors: toStringArray(row.secondary_colors).map(canonicalColor),
   styles: toStringArray(row.styles),
   pattern: row.pattern,
   brand: row.brand,
@@ -783,15 +813,29 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
 
   const analyzeOutfit = async () => {
     if (!imageUri) return;
+    const startedAt = Date.now();
+    let status: 'completed' | 'failed' = 'failed';
+    let httpStatus: number | null = null;
+    let analysisMeta: AnalysisMeta = {};
+    let peopleCount: number | null = null;
+    let garmentCount: number | null = null;
     setAnalyzing(true);
     try {
       const form = new FormData();
       form.append('photo', { uri: imageUri, name: 'outfit.jpg', type: imageType } as unknown as Blob);
       const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
       const response = await fetch(`${apiUrl}/analyze-outfit`, { method: 'POST', body: form });
+      httpStatus = response.status;
       const payload = await response.json();
+      analysisMeta = payload._analysisMeta || {};
       if (!response.ok) throw new Error(payload.error || 'Error de análisis');
-      const detectedPeople: PersonAnalysis[] = payload.people || [];
+      const detectedPeople: PersonAnalysis[] = (payload.people || []).map((person: PersonAnalysis) => ({
+        ...person,
+        items: (person.items || []).map(canonicalizeGarmentColors),
+      }));
+      status = 'completed';
+      peopleCount = detectedPeople.length;
+      garmentCount = detectedPeople.reduce((total, person) => total + (person.items?.length || 0), 0);
       setYoungChildDetected(payload.youngChildDetected === true);
       setPeople(detectedPeople);
       if (detectedPeople.length > 1) void createFaceThumbnails(detectedPeople);
@@ -816,6 +860,23 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       showNotice({ title: 'No hemos podido analizar la foto', message: error instanceof Error ? error.message : 'Comprueba que el servidor esté iniciado.' });
     } finally {
       setAnalyzing(false);
+      const metrics = {
+        analysis_type: 'outfit',
+        status,
+        client_duration_ms: Date.now() - startedAt,
+        server_duration_ms: analysisMeta.serverDurationMs ?? null,
+        provider_duration_ms: analysisMeta.providerDurationMs ?? null,
+        http_status: httpStatus,
+        people_count: peopleCount,
+        garment_count: garmentCount,
+        model: analysisMeta.model || null,
+        request_id: analysisMeta.requestId || null,
+      };
+      void Promise.resolve(supabase.from('analysis_runs').insert(metrics)).then(({ error: metricsError }) => {
+        if (metricsError) console.warn('[Supabase] No se pudo guardar la duración del análisis:', metricsError.message);
+      }).catch((metricsError: unknown) => {
+        console.warn('[Supabase] Fallo de red al guardar la duración del análisis:', metricsError);
+      });
     }
   };
 
@@ -905,7 +966,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         scanFingerprint: {
           category: item.category,
           subcategory: item.subcategory,
-          primaryColor: item.primaryColor,
+          primaryColor: canonicalColor(item.primaryColor),
           brand: item.brand,
           pattern: item.pattern,
           fabricType: item.fabricType,
