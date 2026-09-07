@@ -98,6 +98,26 @@ const mapWithConcurrency = async <T, R>(items: T[], concurrency: number, worker:
   return results;
 };
 
+const AI_IMAGE_MAX_DIMENSION = 1280;
+const AI_IMAGE_JPEG_QUALITY = 0.82;
+const prepareImageForAi = async (uri: string, knownSize?: { width: number; height: number } | null) => {
+  let width = knownSize?.width || 0;
+  let height = knownSize?.height || 0;
+  if (!width || !height) {
+    [width, height] = await new Promise<[number, number]>((resolve, reject) => {
+      Image.getSize(uri, (resolvedWidth, resolvedHeight) => resolve([resolvedWidth, resolvedHeight]), reject);
+    });
+  }
+  const resize = Math.max(width, height) > AI_IMAGE_MAX_DIMENSION
+    ? width >= height ? { width: AI_IMAGE_MAX_DIMENSION } : { height: AI_IMAGE_MAX_DIMENSION }
+    : null;
+  return ImageManipulator.manipulateAsync(
+    uri,
+    resize ? [{ resize }] : [],
+    { compress: AI_IMAGE_JPEG_QUALITY, format: ImageManipulator.SaveFormat.JPEG },
+  );
+};
+
 const COLORS = {
   ink: '#201D1A', muted: '#7C7771', paper: '#F7F4EF', white: '#FFFFFF',
   sage: '#C8D1BD', sageDark: '#50614A', clay: '#D98567', sand: '#E8DED0', line: '#E8E2DA',
@@ -881,16 +901,27 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
     let garmentCount: number | null = null;
     let requestStartedAt: number | null = null;
     let requestDurationMs: number | null = null;
+    let preparationDurationMs: number | null = null;
     let imageSizeBytes: number | null = null;
-    try {
-      imageSizeBytes = new File(imageUri).size || null;
-    } catch {
-      imageSizeBytes = null;
-    }
+    let sentImageSize = imageSize;
     setAnalyzing(true);
     try {
+      const preparationStartedAt = Date.now();
+      let aiImage = { uri: imageUri, width: imageSize?.width || 0, height: imageSize?.height || 0 };
+      try {
+        aiImage = await prepareImageForAi(imageUri, imageSize);
+      } catch (error) {
+        console.warn('[Imagen IA] No se pudo optimizar; se enviará la foto original:', error);
+      }
+      preparationDurationMs = Date.now() - preparationStartedAt;
+      sentImageSize = aiImage.width && aiImage.height ? { width: aiImage.width, height: aiImage.height } : imageSize;
+      try {
+        imageSizeBytes = new File(aiImage.uri).size || null;
+      } catch {
+        imageSizeBytes = null;
+      }
       const form = new FormData();
-      form.append('photo', { uri: imageUri, name: 'outfit.jpg', type: imageType } as unknown as Blob);
+      form.append('photo', { uri: aiImage.uri, name: 'outfit.jpg', type: aiImage.uri === imageUri ? imageType : 'image/jpeg' } as unknown as Blob);
       const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
       requestStartedAt = Date.now();
       const response = await fetch(`${apiUrl}/analyze-outfit`, { method: 'POST', body: form });
@@ -936,14 +967,15 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         analysis_type: 'outfit',
         status,
         client_duration_ms: Date.now() - startedAt,
+        preparation_duration_ms: preparationDurationMs,
         request_duration_ms: requestDurationMs,
         network_duration_ms: requestDurationMs !== null && serverDurationMs !== null ? Math.max(0, requestDurationMs - serverDurationMs) : null,
         server_duration_ms: serverDurationMs,
         provider_duration_ms: analysisMeta.providerDurationMs ?? null,
         postprocess_duration_ms: analysisMeta.postprocessDurationMs ?? null,
         image_size_bytes: analysisMeta.imageBytes ?? imageSizeBytes,
-        image_width: imageSize?.width ?? null,
-        image_height: imageSize?.height ?? null,
+        image_width: sentImageSize?.width ?? null,
+        image_height: sentImageSize?.height ?? null,
         provider_call_count: (analysisMeta.providerAttemptCount || 0) > 0 ? 1 : 0,
         provider_attempt_count: analysisMeta.providerAttemptCount ?? null,
         http_status: httpStatus,
