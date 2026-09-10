@@ -45,6 +45,7 @@ export type DatabaseOutfitRow = {
   user_id: string;
   image_path: string;
   evaluation: Record<string, unknown> | null;
+  style_goal: string | null;
   taken_at: string;
   created_at: string;
 };

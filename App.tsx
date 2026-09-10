@@ -62,6 +62,7 @@ type AnalysisMeta = {
   providerAttemptCount?: number;
   postprocessDurationMs?: number | null;
   imageBytes?: number | null;
+  fallbackUsed?: boolean;
   cacheHit?: boolean;
   candidateBytes?: number | null;
   savedBytes?: number | null;
@@ -70,9 +71,9 @@ type GarmentComparison = { sameGarment: boolean; confidence: number; reason: str
 type GarmentFingerprint = Pick<Garment, 'category' | 'subcategory' | 'primaryColor' | 'brand' | 'pattern' | 'fabricType' | 'styles'>;
 type SavedGarment = Garment & { id: string; imageUri: string; storagePath?: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
 type DuplicateMatch = { candidateId: string; candidate: SavedGarment; saved: SavedGarment; bestImage: 'candidate' | 'saved' };
-type OutfitDraft = { imageUri: string; evaluation: OutfitEvaluation | null; createdAt: string };
+type OutfitDraft = { imageUri: string; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
 type DuplicateReview = { croppedItems: SavedGarment[]; appearanceItems: SavedGarment[]; matchedGarmentIds: Record<string, string>; outfit: OutfitDraft; matches: DuplicateMatch[]; wornItemIds: string[]; updatedItems: SavedGarment[] };
-type SavedOutfit = { id: string; imageUri: string; storagePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; createdAt: string };
+type SavedOutfit = { id: string; imageUri: string; storagePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
 type NoticeAction = { label: string; onPress?: () => void; destructive?: boolean };
 type Notice = { title: string; message: string; actions?: NoticeAction[] };
 const NoticeContext = createContext<{ showNotice: (notice: Notice) => void }>({ showNotice: () => undefined });
@@ -772,6 +773,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   const [duplicateIndex, setDuplicateIndex] = useState(0);
   const [comparisonFullScreenImage, setComparisonFullScreenImage] = useState<string | null>(null);
   const [outfitEvaluation, setOutfitEvaluation] = useState<OutfitEvaluation | null>(null);
+  const [styleGoal, setStyleGoal] = useState<string | null>(null);
   const [youngChildDetected, setYoungChildDetected] = useState(false);
   const [noOutfitFound, setNoOutfitFound] = useState(false);
   const [photoSource, setPhotoSource] = useState<'gallery' | 'camera' | null>(null);
@@ -813,6 +815,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       setDuplicateReview(null);
       setDuplicateIndex(0);
       setOutfitEvaluation(null);
+      setStyleGoal(null);
       setYoungChildDetected(false);
       setNoOutfitFound(false);
       setStage('upload');
@@ -848,7 +851,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         setPhotoDate(metadataDate ? parsePhotoDate(metadataDate as string | number) : new Date().toISOString());
         setAskForPhotoDate(false);
         setManualPhotoDate('');
-        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); setOutfitEvaluation(null); setYoungChildDetected(false); setStage('upload');
+        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); setOutfitEvaluation(null); setStyleGoal(null); setYoungChildDetected(false); setStage('upload');
         setNoOutfitFound(false);
       }
     } catch (error) {
@@ -893,6 +896,10 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
 
   const analyzeOutfit = async () => {
     if (!imageUri) return;
+    if (!styleGoal) {
+      showNotice({ title: 'Elige un objetivo de estilo', message: 'Así valoraremos el outfit según lo que buscas conseguir.' });
+      return;
+    }
     const startedAt = Date.now();
     let status: 'completed' | 'failed' = 'failed';
     let httpStatus: number | null = null;
@@ -921,6 +928,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         imageSizeBytes = null;
       }
       const form = new FormData();
+      form.append('styleGoal', styleGoal);
       form.append('photo', { uri: aiImage.uri, name: 'outfit.jpg', type: aiImage.uri === imageUri ? imageType : 'image/jpeg' } as unknown as Blob);
       const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
       requestStartedAt = Date.now();
@@ -958,7 +966,14 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         }
       }
     } catch (error) {
-      showNotice({ title: 'No hemos podido analizar la foto', message: error instanceof Error ? error.message : 'Comprueba que el servidor esté iniciado.' });
+      showNotice({
+        title: 'No hemos podido analizar la foto',
+        message: `${error instanceof Error ? error.message : 'Comprueba que el servidor esté iniciado.'} La foto se conserva para que puedas volver a intentarlo.`,
+        actions: [
+          { label: 'Cancelar' },
+          { label: 'Reintentar', onPress: () => void analyzeOutfit() },
+        ],
+      });
     } finally {
       setAnalyzing(false);
       if (requestStartedAt && requestDurationMs === null) requestDurationMs = Date.now() - requestStartedAt;
@@ -978,11 +993,13 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         image_height: sentImageSize?.height ?? null,
         provider_call_count: (analysisMeta.providerAttemptCount || 0) > 0 ? 1 : 0,
         provider_attempt_count: analysisMeta.providerAttemptCount ?? null,
+        fallback_used: analysisMeta.fallbackUsed ?? false,
         http_status: httpStatus,
         people_count: peopleCount,
         garment_count: garmentCount,
         model: analysisMeta.model || null,
         request_id: analysisMeta.requestId || null,
+        style_goal: styleGoal,
       });
     }
   };
@@ -1138,7 +1155,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
           croppedItems,
           appearanceItems: croppedItems,
           matchedGarmentIds: {},
-          outfit: { imageUri, evaluation: outfitEvaluation, createdAt: photoDate || new Date().toISOString() },
+          outfit: { imageUri, evaluation: outfitEvaluation, styleGoal: styleGoal || '', createdAt: photoDate || new Date().toISOString() },
           matches: visualMatches,
           wornItemIds: [],
           updatedItems: [],
@@ -1147,7 +1164,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         setStage('duplicates');
         return;
       }
-      await onSave(croppedItems, [], [], { imageUri, evaluation: outfitEvaluation, createdAt: photoDate || new Date().toISOString() }, croppedItems, {});
+      await onSave(croppedItems, [], [], { imageUri, evaluation: outfitEvaluation, styleGoal: styleGoal || '', createdAt: photoDate || new Date().toISOString() }, croppedItems, {});
     } finally {
       setSaving(false);
     }
@@ -1168,7 +1185,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   </View>;
 
   const renderOutfitEvaluation = () => outfitEvaluation ? <View style={styles.outfitEvaluation}>
-    <View style={styles.outfitEvaluationHead}><View style={{ flex: 1 }}><Text style={styles.evaluationEyebrow}>VALORACIÓN DEL OUTFIT</Text><Text style={styles.evaluationTitle}>Cómo funciona tu conjunto</Text></View>{showOutfitScore && <View style={styles.evaluationScore}><Text style={styles.evaluationScoreValue}>{Math.round(outfitEvaluation.score)}</Text><Text style={styles.evaluationScoreMax}>/100</Text></View>}</View>
+    <View style={styles.outfitEvaluationHead}><View style={{ flex: 1 }}><Text style={styles.evaluationEyebrow}>VALORACIÓN · OBJETIVO: {styleGoal?.toLocaleUpperCase('es')}</Text><Text style={styles.evaluationTitle}>Cómo funciona tu conjunto</Text></View>{showOutfitScore && <View style={styles.evaluationScore}><Text style={styles.evaluationScoreValue}>{Math.round(outfitEvaluation.score)}</Text><Text style={styles.evaluationScoreMax}>/100</Text></View>}</View>
     <Text style={styles.evaluationSummary}>{outfitEvaluation.summary}</Text>
     {outfitEvaluation.strengths?.length > 0 && <View style={styles.evaluationBlock}><Text style={styles.evaluationBlockTitle}>Lo que funciona</Text>{outfitEvaluation.strengths.map((text, index) => <View style={styles.evaluationRow} key={`strength-${index}`}><Feather name="check-circle" size={15} color={COLORS.sageDark} /><Text style={styles.evaluationRowText}>{text}</Text></View>)}</View>}
     {showImprovementPoints && outfitEvaluation.improvements?.length > 0 && <View style={styles.evaluationBlock}><Text style={styles.evaluationBlockTitle}>Podría mejorar</Text>{outfitEvaluation.improvements.map((text, index) => <View style={styles.evaluationRow} key={`improvement-${index}`}><Feather name="trending-up" size={15} color={COLORS.clay} /><Text style={styles.evaluationRowText}>{text}</Text></View>)}</View>}
@@ -1291,9 +1308,22 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         <View style={styles.readyCopy}><Text style={styles.readyTitle}>Foto preparada</Text><Text style={styles.readyText}>En el siguiente paso analizaremos las prendas.</Text></View>
       </View>
       {askForPhotoDate && <View style={{ backgroundColor: '#F0F3EC', borderRadius: 16, padding: 14, marginTop: 12 }}><Text style={{ color: COLORS.ink, fontSize: 13, fontWeight: '700' }}>¿Cuándo llevaste este outfit?</Text><Text style={{ color: COLORS.muted, fontSize: 11, marginTop: 4, marginBottom: 10 }}>No hemos encontrado la fecha original de la foto. Es opcional.</Text><View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}><TextInput value={manualPhotoDate} onChangeText={(value) => { setManualPhotoDate(value); const parsed = /^\d{4}-\d{2}-\d{2}$/.test(value) ? parsePhotoDate(`${value}T12:00:00`) : null; setPhotoDate(parsed); }} placeholder="AAAA-MM-DD" placeholderTextColor="#AAA39C" style={[styles.fieldInput, { flex: 1, marginBottom: 0 }]} /><TouchableOpacity onPress={() => setAskForPhotoDate(false)}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>Omitir</Text></TouchableOpacity></View></View>}
-      <TouchableOpacity style={[styles.analyzeButton, analyzing && styles.buttonDisabled]} onPress={analyzeOutfit} disabled={analyzing}>
+      <View style={{ backgroundColor: COLORS.white, borderRadius: 16, padding: 14, marginTop: 12, borderWidth: 1, borderColor: COLORS.line }}>
+        <Text style={{ color: COLORS.ink, fontSize: 13, fontWeight: '700' }}>¿Qué estilo quieres conseguir?</Text>
+        <Text style={{ color: COLORS.muted, fontSize: 11, lineHeight: 16, marginTop: 4 }}>Evaluaremos el conjunto según ese objetivo, no según un estilo genérico.</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
+          {STYLE_OPTIONS.map((option) => {
+            const selected = styleGoal === option;
+            return <TouchableOpacity key={option} onPress={() => setStyleGoal(option)} accessibilityRole="button" accessibilityLabel={`Buscar estilo ${option}`} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 999, paddingHorizontal: 11, paddingVertical: 8, backgroundColor: selected ? COLORS.sageDark : '#F0F3EC', borderWidth: 1, borderColor: selected ? COLORS.sageDark : '#DCE5D7' }}>
+              <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: selected ? COLORS.white : STYLE_ACCENTS[option] }} />
+              <Text style={{ color: selected ? COLORS.white : COLORS.sageDark, fontSize: 12, fontWeight: '700' }}>{option}</Text>
+            </TouchableOpacity>;
+          })}
+        </View>
+      </View>
+      <TouchableOpacity style={[styles.analyzeButton, (analyzing || !styleGoal) && styles.buttonDisabled]} onPress={analyzeOutfit} disabled={analyzing || !styleGoal}>
         {analyzing ? <ActivityIndicator color={COLORS.white} /> : <Feather name="zap" size={18} color={COLORS.white} />}
-        <Text style={styles.analyzeButtonText}>{analyzing ? 'Analizando outfit…' : 'Analizar prendas'}</Text>
+        <Text style={styles.analyzeButtonText}>{analyzing ? 'Analizando outfit…' : styleGoal ? 'Analizar prendas' : 'Elige un estilo para continuar'}</Text>
       </TouchableOpacity>
       {people.length === 0 && !analyzing && imageUri && <Text style={styles.analysisNote}>Pulsa “Analizar prendas” para detectar a las personas y sus outfits.</Text>}
       <TouchableOpacity style={styles.secondaryButton} onPress={chooseFromGallery}>
@@ -1498,7 +1528,7 @@ function Outfits({ outfits, onDelete, onRestore, onDeletePermanent, showOutfitSc
   };
   return <>
     <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}><View style={{ height: 18 }} /><View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>HISTORIAL</Text><Text style={styles.title}>Tus outfits</Text><Text style={styles.addIntro}>{outfits.length} outfits analizados.</Text></View><View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}><TouchableOpacity onPress={() => setSortBy('date')} style={[styles.categoryFilter, sortBy === 'date' && styles.categoryFilterActive]}><Feather name="calendar" size={14} color={sortBy === 'date' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'date' && styles.categoryFilterTextActive]}>Más recientes</Text></TouchableOpacity>{showOutfitScore && <TouchableOpacity onPress={() => setSortBy('score')} style={[styles.categoryFilter, sortBy === 'score' && styles.categoryFilterActive]}><Feather name="star" size={14} color={sortBy === 'score' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'score' && styles.categoryFilterTextActive]}>Mejor puntuación</Text></TouchableOpacity>}</View>{orderedOutfits.map((outfit) => <OutfitHistoryCard key={outfit.id} outfit={outfit} onOpen={() => setSelectedOutfit(outfit)} onDelete={() => deleteOutfit(outfit)} showOutfitScore={showOutfitScore} />)}</ScrollView>
-    <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><Image source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} /></TouchableOpacity>{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.fabricType} · {item.texture}</Text>{hasUsefulValue(item.materialEstimate) && <Text style={styles.cardMeta}>Composición aparente: {item.materialEstimate}</Text>}<Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
+    <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><Image source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} /></TouchableOpacity>{selectedOutfit.styleGoal && <View style={{ alignSelf: 'flex-start', backgroundColor: '#F0F3EC', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 12 }}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>OBJETIVO: {selectedOutfit.styleGoal.toLocaleUpperCase('es')}</Text></View>}{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.fabricType} · {item.texture}</Text>{hasUsefulValue(item.materialEstimate) && <Text style={styles.cardMeta}>Composición aparente: {item.materialEstimate}</Text>}<Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
     <Modal visible={fullScreenImage !== null} transparent animationType="fade" onRequestClose={() => setFullScreenImage(null)}><View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}><TouchableOpacity onPress={() => setFullScreenImage(null)} style={{ position: 'absolute', top: 52, right: 20, zIndex: 2, width: 42, height: 42, borderRadius: 21, backgroundColor: 'rgba(255,255,255,0.9)', alignItems: 'center', justifyContent: 'center' }}><Feather name="x" size={22} color={COLORS.ink} /></TouchableOpacity>{fullScreenImage && <Image source={{ uri: fullScreenImage }} resizeMode="contain" style={{ width: '100%', height: '100%' }} />}</View></Modal>
     {recentlyDeleted && <View style={{ position: 'absolute', left: 20, right: 20, bottom: 22, minHeight: 54, borderRadius: 16, backgroundColor: COLORS.ink, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10, elevation: 6 }}><Text style={{ color: COLORS.white, fontSize: 12, fontWeight: '700' }}>Outfit eliminado</Text><TouchableOpacity onPress={undoDelete} style={{ paddingVertical: 10, paddingLeft: 16 }}><Text style={{ color: '#DDE7D6', fontSize: 12, fontWeight: '800' }}>Deshacer</Text></TouchableOpacity></View>}
   </>;
@@ -1530,10 +1560,10 @@ function HomeCategoryCard({ category, imageIndex, onPress }: { category: HomeCat
   </TouchableOpacity>;
 }
 
-function Home({ items, onAdd, onCamera, onOpenWardrobe, onOpenProfile }: { items: SavedGarment[]; onAdd: () => void; onCamera: () => void; onOpenWardrobe: (categoryKey?: string) => void; onOpenProfile: () => void }) {
+function Home({ items, displayName, onAdd, onCamera, onOpenWardrobe, onOpenProfile }: { items: SavedGarment[]; displayName: string; onAdd: () => void; onCamera: () => void; onOpenWardrobe: (categoryKey?: string) => void; onOpenProfile: () => void }) {
   const todayLabel = new Intl.DateTimeFormat('es-ES', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date()).toLocaleUpperCase('es');
   const hour = new Date().getHours();
-  const greeting = `${hour < 14 ? 'Buenos días' : hour < 21 ? 'Buenas tardes' : 'Buenas noches'}, Kevin M.B.`;
+  const greeting = `${hour < 14 ? 'Buenos días' : hour < 21 ? 'Buenas tardes' : 'Buenas noches'}, ${displayName}`;
   const homeCategories = Object.values(items.reduce<Record<string, HomeCategory>>((groups, item) => {
     const category = normalizedCategory(item.category);
     groups[category.key] = {
@@ -1573,9 +1603,9 @@ function Home({ items, onAdd, onCamera, onOpenWardrobe, onOpenProfile }: { items
   }, [carouselSignature]);
 
   return <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
-    <View style={styles.header}>
+      <View style={styles.header}>
       <View style={{ flex: 1, paddingRight: 12 }}><Text numberOfLines={1} style={styles.eyebrow}>{todayLabel}</Text><Text numberOfLines={1} adjustsFontSizeToFit style={styles.title}>{greeting}</Text></View>
-      <TouchableOpacity style={styles.avatar} onPress={onOpenProfile}><Text style={styles.avatarText}>K</Text></TouchableOpacity>
+      <TouchableOpacity style={styles.avatar} onPress={onOpenProfile}><Text style={styles.avatarText}>{displayName.charAt(0).toLocaleUpperCase('es')}</Text></TouchableOpacity>
     </View>
 
     <TouchableOpacity style={styles.captureCard} onPress={onCamera} activeOpacity={0.88}>
@@ -1726,6 +1756,7 @@ export default function App() {
             storagePath: row.image_path,
             garments: (linksByOutfit.get(row.id) || []).map((id) => garmentsById.get(id)).filter((item): item is SavedGarment => Boolean(item)),
             evaluation: row.evaluation as OutfitEvaluation | null,
+            styleGoal: row.style_goal || '',
             createdAt: row.taken_at || row.created_at,
           };
         } catch (error) {
@@ -1788,6 +1819,7 @@ export default function App() {
         user_id: session.user.id,
         image_path: uploadedOutfitPath,
         evaluation: outfit.evaluation,
+        style_goal: outfit.styleGoal,
         taken_at: outfit.createdAt,
       }).select().single();
       if (outfitError || !outfitRow) throw new Error(outfitError?.message || 'No hemos podido guardar el outfit.');
@@ -1815,6 +1847,7 @@ export default function App() {
         storagePath: uploadedOutfitPath,
         garments: outfitLinks.map((link) => nextGarments.find((item) => item.id === link.garment_id)).filter((item): item is SavedGarment => Boolean(item)),
         evaluation: outfit.evaluation,
+        styleGoal: outfit.styleGoal,
         createdAt: (outfitRow as DatabaseOutfitRow).taken_at,
       };
       setSavedGarments(nextGarments);
@@ -1916,7 +1949,7 @@ export default function App() {
   if (!onboardingCompleted) return <OnboardingScreen initialName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || ''} initialGender={session.user.user_metadata?.gender_identity} initialStyles={session.user.user_metadata?.style_preferences} initialColors={session.user.user_metadata?.color_preferences} initialShops={session.user.user_metadata?.favorite_shops} initialShowOutfitScore={session.user.user_metadata?.show_outfit_score !== false} initialShowImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} onComplete={() => setOnboardingCompleted(true)} />;
   return <NoticeContext.Provider value={{ showNotice: setNotice }}><SafeAreaView style={styles.safe}>
     <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} />
-    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} wardrobeItems={savedGarments} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} onDeletePermanent={deleteOutfitPermanently} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} /> : <EmptyScreen tab={tab} />}</View>
+    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} displayName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'tu armario'} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} wardrobeItems={savedGarments} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} onDeletePermanent={deleteOutfitPermanently} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} /> : <EmptyScreen tab={tab} />}</View>
     {tab !== 'perfil' && <View style={styles.nav}>
       {nav.map((item) => {
         const active = tab === item.key;

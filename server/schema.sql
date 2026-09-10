@@ -29,6 +29,7 @@ create table if not exists public.outfits (
   user_id uuid not null references auth.users(id) on delete cascade,
   image_path text not null,
   evaluation jsonb,
+  style_goal text,
   taken_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
@@ -43,6 +44,7 @@ create table if not exists public.outfit_garments (
 );
 
 -- Compatible con instalaciones que ya tenían la tabla creada.
+alter table public.outfits add column if not exists style_goal text;
 alter table public.outfit_garments add column if not exists item_box jsonb not null default '{"xMin":0,"yMin":0,"xMax":1000,"yMax":1000}'::jsonb;
 alter table public.outfit_garments add column if not exists display_rotation integer not null default 0;
 alter table public.outfit_garments add column if not exists confidence numeric not null default 0;
@@ -75,9 +77,11 @@ create table if not exists public.analysis_runs (
   cache_hit_count integer check (cache_hit_count >= 0),
   provider_call_count integer check (provider_call_count >= 0),
   provider_attempt_count integer check (provider_attempt_count >= 0),
+  fallback_used boolean not null default false,
   http_status integer check (http_status between 100 and 599),
   people_count integer check (people_count >= 0),
   garment_count integer check (garment_count >= 0),
+  style_goal text,
   model text,
   request_id text,
   created_at timestamptz not null default now()
@@ -94,16 +98,22 @@ alter table public.outfit_garments enable row level security;
 alter table public.garment_usage_events enable row level security;
 alter table public.analysis_runs enable row level security;
 
+drop policy if exists "Users manage their garments" on public.garments;
 create policy "Users manage their garments" on public.garments
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+drop policy if exists "Users manage their outfits" on public.outfits;
 create policy "Users manage their outfits" on public.outfits
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+drop policy if exists "Users manage outfit garments" on public.outfit_garments;
 create policy "Users manage outfit garments" on public.outfit_garments
   for all using (exists (select 1 from public.outfits o where o.id = outfit_id and o.user_id = auth.uid()))
   with check (exists (select 1 from public.outfits o where o.id = outfit_id and o.user_id = auth.uid()));
+drop policy if exists "Users manage their usage events" on public.garment_usage_events;
 create policy "Users manage their usage events" on public.garment_usage_events
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+drop policy if exists "Users insert their analysis runs" on public.analysis_runs;
 create policy "Users insert their analysis runs" on public.analysis_runs
   for insert with check (auth.uid() = user_id);
+drop policy if exists "Users read their analysis runs" on public.analysis_runs;
 create policy "Users read their analysis runs" on public.analysis_runs
   for select using (auth.uid() = user_id);

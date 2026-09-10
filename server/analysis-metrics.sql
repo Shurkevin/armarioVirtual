@@ -21,9 +21,11 @@ create table if not exists public.analysis_runs (
   cache_hit_count integer check (cache_hit_count >= 0),
   provider_call_count integer check (provider_call_count >= 0),
   provider_attempt_count integer check (provider_attempt_count >= 0),
+  fallback_used boolean not null default false,
   http_status integer check (http_status between 100 and 599),
   people_count integer check (people_count >= 0),
   garment_count integer check (garment_count >= 0),
+  style_goal text,
   model text,
   request_id text,
   created_at timestamptz not null default now()
@@ -42,6 +44,8 @@ alter table public.analysis_runs add column if not exists comparison_failure_cou
 alter table public.analysis_runs add column if not exists cache_hit_count integer check (cache_hit_count >= 0);
 alter table public.analysis_runs add column if not exists provider_call_count integer check (provider_call_count >= 0);
 alter table public.analysis_runs add column if not exists provider_attempt_count integer check (provider_attempt_count >= 0);
+alter table public.analysis_runs add column if not exists fallback_used boolean not null default false;
+alter table public.analysis_runs add column if not exists style_goal text;
 
 create index if not exists analysis_runs_user_created_idx
   on public.analysis_runs(user_id, created_at desc);
@@ -74,6 +78,7 @@ select
   sum(cache_hit_count) as cache_hits,
   sum(provider_call_count) as gemini_calls,
   sum(provider_attempt_count) as gemini_attempts,
+  count(*) filter (where fallback_used) as fallback_uses,
   round(100.0 * count(*) filter (where status = 'failed') / nullif(count(*), 0), 1) as failure_percent
 from public.analysis_runs
 where created_at >= now() - interval '30 days'
