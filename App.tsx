@@ -1146,6 +1146,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         cache_hit_count: comparisonMetas.filter((meta) => meta.cacheHit).length,
         provider_call_count: comparisonMetas.filter((meta) => !meta.cacheHit && (meta.providerAttemptCount || 0) > 0).length,
         provider_attempt_count: sumMetric(comparisonMetas.map((meta) => meta.providerAttemptCount)),
+        fallback_used: comparisonMetas.some((meta) => meta.fallbackUsed),
         model: comparisonMetas.find((meta) => meta.model)?.model || null,
       });
       const visualMatches = comparisonResults.map((result) => result.match).filter((match): match is DuplicateMatch => match !== null);
@@ -1628,6 +1629,15 @@ function Home({ items, displayName, onAdd, onCamera, onOpenWardrobe, onOpenProfi
 }
 
 export default function App() {
+  useEffect(() => {
+    const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
+    void fetch(`${apiUrl}/health`).then((response) => {
+      if (!response.ok) console.warn(`[Backend] El precalentamiento ha respondido con HTTP ${response.status}.`);
+    }).catch((error: unknown) => {
+      console.warn('[Backend] No se ha podido precalentar el servidor:', error);
+    });
+  }, []);
+
   const [tab, setTab] = useState<Tab>('inicio');
   const [captureFromCamera, setCaptureFromCamera] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);

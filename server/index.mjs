@@ -35,16 +35,18 @@ const writeComparisonCache = (key, value) => {
   }
 };
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-const fetchGeminiWithRetry = async ({ url, options, log }) => {
+const fetchGeminiWithRetry = async ({ model, retryModel, makeUrl, options, log }) => {
   let lastNetworkError;
   for (let attempt = 0; attempt <= GEMINI_RETRY_DELAYS_MS.length; attempt += 1) {
+    const attemptModel = attempt === 0 || !retryModel ? model : retryModel;
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(makeUrl(attemptModel), options);
       if (response.status !== 503 || attempt === GEMINI_RETRY_DELAYS_MS.length) {
-        return { response, attemptCount: attempt + 1 };
+        return { response, attemptCount: attempt + 1, model: attemptModel };
       }
       const delay = GEMINI_RETRY_DELAYS_MS[attempt];
-      log(`Gemini está temporalmente saturado (HTTP 503). Reintentaremos en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
+      const nextModel = retryModel || model;
+      log(`Gemini ${attemptModel} está temporalmente saturado (HTTP 503). Reintentaremos con ${nextModel} en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
       await response.body?.cancel();
       await wait(delay);
     } catch (error) {
@@ -53,7 +55,8 @@ const fetchGeminiWithRetry = async ({ url, options, log }) => {
         throw Object.assign(error instanceof Error ? error : new Error(String(error)), { geminiAttemptCount: attempt + 1 });
       }
       const delay = GEMINI_RETRY_DELAYS_MS[attempt];
-      log(`No se ha podido contactar con Gemini. Reintentaremos en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
+      const nextModel = retryModel || model;
+      log(`No se ha podido contactar con Gemini ${attemptModel}. Reintentaremos con ${nextModel} en ${Math.round(delay / 1000)} s (${attempt + 1}/${GEMINI_RETRY_DELAYS_MS.length}).`);
       await wait(delay);
     }
   }
@@ -168,6 +171,11 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
   const requestId = randomUUID().slice(0, 8);
   const startedAt = Date.now();
   const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+  const retryModel = process.env.GEMINI_FALLBACK_MODEL === undefined
+    ? 'gemini-3.1-flash-lite'
+    : process.env.GEMINI_FALLBACK_MODEL.trim();
+  let effectiveModel = model;
+  let fallbackUsed = false;
   const thinkingLevel = process.env.GEMINI_THINKING_LEVEL || 'minimal';
   let providerDurationMs = 0;
   let providerAttemptCount = 0;
@@ -175,7 +183,8 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
   const log = (message) => console.log(`[${new Date().toISOString()}] [${requestId}] ${message}`);
   const comparisonMeta = () => ({
     requestId,
-    model,
+    model: effectiveModel,
+    fallbackUsed,
     serverDurationMs: Date.now() - startedAt,
     providerDurationMs,
     providerAttemptCount,
@@ -189,7 +198,7 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
   if (!process.env.GEMINI_API_KEY) return response.status(503).json({ error: 'El servidor no tiene configurada GEMINI_API_KEY.', _analysisMeta: comparisonMeta() });
 
   try {
-    const cacheKey = `${model}:${thinkingLevel}:v2:${imageDigest(candidate.buffer)}:${imageDigest(saved.buffer)}`;
+    const cacheKey = `${model}:${retryModel}:${thinkingLevel}:v3:${imageDigest(candidate.buffer)}:${imageDigest(saved.buffer)}`;
     const cachedComparison = readComparisonCache(cacheKey);
     if (cachedComparison) {
       cacheHit = true;
@@ -203,7 +212,9 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
     let geminiResponse;
     try {
       const geminiResult = await fetchGeminiWithRetry({
-      url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      model,
+      retryModel,
+      makeUrl: (modelName) => `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
       options: {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
@@ -237,11 +248,13 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
       });
       geminiResponse = geminiResult.response;
       providerAttemptCount = geminiResult.attemptCount;
+      effectiveModel = geminiResult.model;
+      fallbackUsed = effectiveModel !== model;
     } finally {
       clearInterval(waitingLog);
       providerDurationMs = Date.now() - geminiStartedAt;
     }
-    log(`Gemini ha respondido a la comparación con HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
+    log(`Gemini ${effectiveModel} ha respondido a la comparación con HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
     const result = await geminiResponse.json();
     if (!geminiResponse.ok) throw Object.assign(new Error(result?.error?.message || 'Error de Gemini'), { status: geminiResponse.status });
     const outputText = result?.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text;
@@ -312,7 +325,9 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     let geminiResponse;
     try {
       const requestGemini = (modelName) => fetchGeminiWithRetry({
-      url: `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
+      model: modelName,
+      retryModel: fallbackModel,
+      makeUrl: (attemptModel) => `https://generativelanguage.googleapis.com/v1beta/models/${attemptModel}:generateContent`,
       options: {
         method: 'POST',
         headers: {
@@ -436,24 +451,18 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
           throw error;
         }
       };
-      let geminiResult;
-      try {
-        geminiResult = await callModel(model);
-      } catch (error) {
-        if (!fallbackModel || fallbackModel === model) throw error;
-        fallbackUsed = true;
-        effectiveModel = fallbackModel;
-        log(`El modelo principal no ha respondido. Activando fallback (${fallbackModel})…`);
-        geminiResult = await callModel(fallbackModel);
-      }
+      let geminiResult = await callModel(model);
+      effectiveModel = geminiResult.model;
+      fallbackUsed = effectiveModel !== model;
       const fallbackStatuses = new Set([404, 429, 500, 502, 503, 504]);
-      if (!geminiResult.response.ok && fallbackStatuses.has(geminiResult.response.status) && fallbackModel && fallbackModel !== model && !fallbackUsed) {
+      if (!geminiResult.response.ok && fallbackStatuses.has(geminiResult.response.status) && fallbackModel && effectiveModel !== fallbackModel) {
         const primaryStatus = geminiResult.response.status;
         await geminiResult.response.body?.cancel();
         fallbackUsed = true;
         effectiveModel = fallbackModel;
         log(`El modelo principal ha devuelto HTTP ${primaryStatus}. Activando fallback (${fallbackModel})…`);
         geminiResult = await callModel(fallbackModel);
+        effectiveModel = geminiResult.model;
       }
       geminiResponse = geminiResult.response;
     } finally {
@@ -461,7 +470,7 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
       providerDurationMs = Date.now() - geminiStartedAt;
     }
 
-    log(`Cabeceras recibidas de Gemini: HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
+    log(`Cabeceras recibidas de Gemini ${effectiveModel}: HTTP ${geminiResponse.status} tras ${Date.now() - geminiStartedAt} ms.`);
     const responseBodyStartedAt = Date.now();
     const result = await geminiResponse.json();
     providerDurationMs = Date.now() - geminiStartedAt;
