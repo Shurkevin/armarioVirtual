@@ -1,9 +1,11 @@
 import 'dotenv/config';
 import { createHash, randomUUID } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
+import { createClient } from '@supabase/supabase-js';
 import cors from 'cors';
 import express from 'express';
 import multer from 'multer';
+import sharp from 'sharp';
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -15,8 +17,72 @@ const GEMINI_RETRY_DELAYS_MS = [2500, 6000, 12000];
 const OUTFIT_STYLE_GOALS = new Set(['Casual', 'Minimalista', 'Clásico', 'Urbano', 'Deportivo', 'Elegante']);
 const COMPARISON_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const COMPARISON_CACHE_MAX_ENTRIES = 500;
+const COMPARISON_PROMPT_VERSION = 'v4';
 const comparisonCache = new Map();
 const imageDigest = (buffer) => createHash('sha256').update(buffer).digest('hex');
+const perceptualImageHash = async (buffer) => {
+  const pixels = await sharp(buffer, { failOn: 'none' })
+    .rotate()
+    .resize(9, 8, { fit: 'fill' })
+    .grayscale()
+    .raw()
+    .toBuffer();
+  let hash = 0n;
+  for (let row = 0; row < 8; row += 1) {
+    for (let column = 0; column < 8; column += 1) {
+      hash = (hash << 1n) | (pixels[(row * 9) + column] > pixels[(row * 9) + column + 1] ? 1n : 0n);
+    }
+  }
+  return hash.toString(16).padStart(16, '0');
+};
+const requestSupabaseClient = (request) => {
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL;
+  const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+  const authorization = request.get('authorization');
+  if (!authorization?.startsWith('Bearer ')) throw Object.assign(new Error('Falta la sesión del usuario.'), { status: 401 });
+  if (!supabaseUrl || !supabaseAnonKey) throw Object.assign(new Error('Supabase no está configurado en el servidor.'), { status: 503 });
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: authorization } },
+  });
+};
+const readPersistentComparisonCache = async (supabase, key, log) => {
+  const { data, error } = await supabase
+    .from('garment_comparison_cache')
+    .select('result, expires_at')
+    .eq('candidate_hash', key.candidateHash)
+    .eq('saved_hash', key.savedHash)
+    .eq('candidate_digest', key.candidateDigest)
+    .eq('saved_digest', key.savedDigest)
+    .eq('model', key.model)
+    .eq('retry_model', key.retryModel)
+    .eq('thinking_level', key.thinkingLevel)
+    .eq('prompt_version', COMPARISON_PROMPT_VERSION)
+    .maybeSingle();
+  if (error) {
+    log(`Caché persistente no disponible: ${error.message}`);
+    return null;
+  }
+  if (!data || new Date(data.expires_at).getTime() <= Date.now()) return null;
+  return data.result;
+};
+const writePersistentComparisonCache = async (supabase, key, comparison, userId, savedGarmentId, log) => {
+  const { error } = await supabase.from('garment_comparison_cache').upsert({
+    user_id: userId,
+    saved_garment_id: savedGarmentId,
+    candidate_hash: key.candidateHash,
+    saved_hash: key.savedHash,
+    candidate_digest: key.candidateDigest,
+    saved_digest: key.savedDigest,
+    model: key.model,
+    retry_model: key.retryModel,
+    thinking_level: key.thinkingLevel,
+    prompt_version: COMPARISON_PROMPT_VERSION,
+    result: comparison,
+    expires_at: new Date(Date.now() + COMPARISON_CACHE_TTL_MS).toISOString(),
+  }, { onConflict: 'user_id,candidate_digest,saved_digest,model,retry_model,thinking_level,prompt_version' });
+  if (error) log(`No se ha podido persistir la caché de comparación: ${error.message}`);
+};
 const readComparisonCache = (key) => {
   const entry = comparisonCache.get(key);
   if (!entry) return null;
@@ -180,6 +246,7 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
   let providerDurationMs = 0;
   let providerAttemptCount = 0;
   let cacheHit = false;
+  let savedBytes = null;
   const log = (message) => console.log(`[${new Date().toISOString()}] [${requestId}] ${message}`);
   const comparisonMeta = () => ({
     requestId,
@@ -190,22 +257,67 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
     providerAttemptCount,
     cacheHit,
     candidateBytes: request.files?.candidate?.[0]?.size || null,
-    savedBytes: request.files?.saved?.[0]?.size || null,
+    savedBytes,
   });
   const candidate = request.files?.candidate?.[0];
-  const saved = request.files?.saved?.[0];
-  if (!candidate || !saved) return response.status(400).json({ error: 'Faltan las dos fotos que hay que comparar.', _analysisMeta: comparisonMeta() });
+  const legacySavedImage = request.files?.saved?.[0];
+  const savedGarmentId = request.body?.savedGarmentId;
+  if (!candidate || (!savedGarmentId && !legacySavedImage)) return response.status(400).json({ error: 'Faltan la foto nueva o la prenda guardada.', _analysisMeta: comparisonMeta() });
   if (!process.env.GEMINI_API_KEY) return response.status(503).json({ error: 'El servidor no tiene configurada GEMINI_API_KEY.', _analysisMeta: comparisonMeta() });
 
   try {
-    const cacheKey = `${model}:${retryModel}:${thinkingLevel}:v3:${imageDigest(candidate.buffer)}:${imageDigest(saved.buffer)}`;
+    let supabase = null;
+    let savedGarment = null;
+    let savedBuffer;
+    let savedMimeType;
+    if (savedGarmentId) {
+      supabase = requestSupabaseClient(request);
+      const { data, error: savedGarmentError } = await supabase
+        .from('garments')
+        .select('id, user_id, image_path')
+        .eq('id', savedGarmentId)
+        .maybeSingle();
+      if (savedGarmentError || !data) {
+        throw Object.assign(new Error('La prenda guardada no existe o no pertenece al usuario.'), { status: 404 });
+      }
+      savedGarment = data;
+      const { data: savedImage, error: savedImageError } = await supabase.storage
+        .from('garment-images')
+        .download(savedGarment.image_path);
+      if (savedImageError || !savedImage) {
+        throw Object.assign(new Error('No se ha podido descargar la foto guardada.'), { status: 502 });
+      }
+      savedBuffer = Buffer.from(await savedImage.arrayBuffer());
+      savedMimeType = savedImage.type || 'image/jpeg';
+    } else {
+      savedBuffer = legacySavedImage.buffer;
+      savedMimeType = legacySavedImage.mimetype;
+      log('Comparación recibida con el formato anterior; se omite la caché persistente.');
+    }
+    savedBytes = savedBuffer.byteLength;
+    const [candidateHash, savedHash] = await Promise.all([
+      perceptualImageHash(candidate.buffer),
+      perceptualImageHash(savedBuffer),
+    ]);
+    const candidateDigest = imageDigest(candidate.buffer);
+    const savedDigest = imageDigest(savedBuffer);
+    const cacheIdentity = { candidateHash, savedHash, candidateDigest, savedDigest, model, retryModel, thinkingLevel };
+    const cacheScope = savedGarment?.user_id || 'legacy';
+    const cacheKey = `${cacheScope}:${model}:${retryModel}:${thinkingLevel}:${COMPARISON_PROMPT_VERSION}:${candidateDigest}:${savedDigest}`;
     const cachedComparison = readComparisonCache(cacheKey);
     if (cachedComparison) {
       cacheHit = true;
-      log('Comparación recuperada de caché.');
+      log('Comparación recuperada de caché en memoria.');
       return response.json({ ...cachedComparison, _analysisMeta: comparisonMeta() });
     }
-    log(`Fotos de comparación recibidas: nueva ${(candidate.size / 1024).toFixed(0)} KB, guardada ${(saved.size / 1024).toFixed(0)} KB.`);
+    const persistedComparison = supabase ? await readPersistentComparisonCache(supabase, cacheIdentity, log) : null;
+    if (persistedComparison) {
+      cacheHit = true;
+      writeComparisonCache(cacheKey, persistedComparison);
+      log('Comparación recuperada de caché persistente.');
+      return response.json({ ...persistedComparison, _analysisMeta: comparisonMeta() });
+    }
+    log(`Fotos de comparación recibidas: nueva ${(candidate.size / 1024).toFixed(0)} KB, guardada ${(savedBytes / 1024).toFixed(0)} KB.`);
     log(`Comparando visualmente dos prendas con Gemini (${model})…`);
     const geminiStartedAt = Date.now();
     const waitingLog = setInterval(() => log(`Gemini sigue comparando las prendas… ${Math.round((Date.now() - geminiStartedAt) / 1000)} s de espera.`), 5000);
@@ -224,7 +336,7 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
           { text: 'IMAGEN NUEVA' },
           { inlineData: { mimeType: candidate.mimetype, data: candidate.buffer.toString('base64') } },
           { text: 'IMAGEN GUARDADA' },
-          { inlineData: { mimeType: saved.mimetype, data: saved.buffer.toString('base64') } },
+          { inlineData: { mimeType: savedMimeType, data: savedBuffer.toString('base64') } },
         ] }],
         generationConfig: {
           thinkingConfig: { thinkingLevel },
@@ -261,12 +373,17 @@ app.post('/compare-garments', upload.fields([{ name: 'candidate', maxCount: 1 },
     if (!outputText) throw new Error('Gemini no devolvió una comparación utilizable.');
     const comparison = JSON.parse(outputText);
     writeComparisonCache(cacheKey, comparison);
+    if (supabase && savedGarment) {
+      void writePersistentComparisonCache(supabase, cacheIdentity, comparison, savedGarment.user_id, savedGarment.id, log);
+    }
     log(`Comparación completada en ${Date.now() - startedAt} ms: ${comparison.sameGarment ? 'posible duplicado' : 'prendas distintas'} (${Math.round(comparison.confidence * 100)}%).`);
     response.json({ ...comparison, _analysisMeta: comparisonMeta() });
   } catch (error) {
     providerAttemptCount = error?.geminiAttemptCount || providerAttemptCount;
     console.error(`[${new Date().toISOString()}] [${requestId}] Error comparando prendas:`, error?.message || error);
-    response.status(502).json({ error: 'No se han podido comparar visualmente las prendas.', _analysisMeta: comparisonMeta() });
+    const status = error?.status || 502;
+    const message = error?.status ? error.message : 'No se han podido comparar visualmente las prendas.';
+    response.status(status).json({ error: message, _analysisMeta: comparisonMeta() });
   }
 });
 

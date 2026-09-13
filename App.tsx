@@ -6,6 +6,7 @@ import {
   Alert,
   Animated,
   Easing,
+  FlatList,
   Image,
   Linking as NativeLinking,
   Modal,
@@ -20,6 +21,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Image as CachedImage } from 'expo-image';
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
@@ -31,6 +33,34 @@ import { supabase } from './lib/supabase';
 import type { DatabaseGarmentRow, DatabaseOutfitRow } from './lib/supabase';
 
 WebBrowser.maybeCompleteAuthSession();
+
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
+const STARTUP_LOADING_MIN_MS = 800;
+const STARTUP_LOADING_MAX_MS = 2200;
+const ANALYSIS_WARMUP_WAIT_MS = 35000;
+const backendWarmupStartedAt = Date.now();
+const backendWarmupPromise = fetch(`${API_URL}/health`).then((response) => {
+  const durationMs = Date.now() - backendWarmupStartedAt;
+  if (!response.ok) console.warn(`[Backend] El precalentamiento ha respondido con HTTP ${response.status}.`);
+  else console.log(`[Backend] Servidor preparado en ${durationMs} ms.`);
+  return { ok: response.ok, durationMs };
+}).catch((error: unknown) => {
+  const durationMs = Date.now() - backendWarmupStartedAt;
+  console.warn('[Backend] No se ha podido precalentar el servidor:', error);
+  return { ok: false, durationMs };
+});
+
+const waitForBackendWarmup = async (maxWaitMs = ANALYSIS_WARMUP_WAIT_MS) => {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      backendWarmupPromise,
+      new Promise<void>((resolve) => { timeout = setTimeout(resolve, maxWaitMs); }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
 
 type Tab = 'inicio' | 'armario' | 'outfits' | 'captura' | 'compras' | 'perfil';
 type AddStage = 'upload' | 'person' | 'review' | 'duplicates';
@@ -69,11 +99,26 @@ type AnalysisMeta = {
 };
 type GarmentComparison = { sameGarment: boolean; confidence: number; reason: string; bestImage: 'candidate' | 'saved'; _analysisMeta?: AnalysisMeta; clientDurationMs: number; httpStatus: number };
 type GarmentFingerprint = Pick<Garment, 'category' | 'subcategory' | 'primaryColor' | 'brand' | 'pattern' | 'fabricType' | 'styles'>;
-type SavedGarment = Garment & { id: string; imageUri: string; storagePath?: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
-type DuplicateMatch = { candidateId: string; candidate: SavedGarment; saved: SavedGarment; bestImage: 'candidate' | 'saved' };
+type SavedGarment = Garment & { id: string; imageUri: string; thumbnailUri?: string; storagePath?: string; thumbnailStoragePath?: string; wearCount: number; scanFingerprint?: GarmentFingerprint } & Record<string, any>;
+type DuplicateMatch = {
+  candidateId: string;
+  candidate: SavedGarment;
+  saved: SavedGarment;
+  bestImage: 'candidate' | 'saved';
+  confidence: number;
+  reason: string;
+  metadataScore: number;
+  source: 'visual' | 'metadata';
+};
+type DuplicateComparisonResult = { match: DuplicateMatch | null; comparison?: GarmentComparison; failed: boolean };
+type PreparedDuplicateChecks = {
+  key: string;
+  croppedItems: SavedGarment[];
+  matches: DuplicateMatch[];
+};
 type OutfitDraft = { imageUri: string; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
 type DuplicateReview = { croppedItems: SavedGarment[]; appearanceItems: SavedGarment[]; matchedGarmentIds: Record<string, string>; outfit: OutfitDraft; matches: DuplicateMatch[]; wornItemIds: string[]; updatedItems: SavedGarment[] };
-type SavedOutfit = { id: string; imageUri: string; storagePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
+type SavedOutfit = { id: string; imageUri: string; thumbnailUri?: string; storagePath?: string; thumbnailStoragePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
 type NoticeAction = { label: string; onPress?: () => void; destructive?: boolean };
 type Notice = { title: string; message: string; actions?: NoticeAction[] };
 const NoticeContext = createContext<{ showNotice: (notice: Notice) => void }>({ showNotice: () => undefined });
@@ -101,6 +146,12 @@ const mapWithConcurrency = async <T, R>(items: T[], concurrency: number, worker:
 
 const AI_IMAGE_MAX_DIMENSION = 1280;
 const AI_IMAGE_JPEG_QUALITY = 0.82;
+const GARMENT_STORAGE_MAX_DIMENSION = 1024;
+const OUTFIT_STORAGE_MAX_DIMENSION = 1600;
+const GARMENT_THUMBNAIL_MAX_DIMENSION = 360;
+const OUTFIT_THUMBNAIL_MAX_DIMENSION = 480;
+const STORAGE_IMAGE_JPEG_QUALITY = 0.78;
+const THUMBNAIL_JPEG_QUALITY = 0.66;
 const prepareImageForAi = async (uri: string, knownSize?: { width: number; height: number } | null) => {
   let width = knownSize?.width || 0;
   let height = knownSize?.height || 0;
@@ -117,6 +168,26 @@ const prepareImageForAi = async (uri: string, knownSize?: { width: number; heigh
     resize ? [{ resize }] : [],
     { compress: AI_IMAGE_JPEG_QUALITY, format: ImageManipulator.SaveFormat.JPEG },
   );
+};
+
+const normalizeStoredImage = async (uri: string, maxDimension: number, quality: number) => {
+  const [width, height] = await new Promise<[number, number]>((resolve, reject) => {
+    Image.getSize(uri, (resolvedWidth, resolvedHeight) => resolve([resolvedWidth, resolvedHeight]), reject);
+  });
+  const resize = Math.max(width, height) > maxDimension
+    ? width >= height ? { width: maxDimension } : { height: maxDimension }
+    : null;
+  return ImageManipulator.manipulateAsync(
+    uri,
+    resize ? [{ resize }] : [],
+    { compress: quality, format: ImageManipulator.SaveFormat.JPEG },
+  );
+};
+
+const prepareStoredImageVariants = async (uri: string, masterMaxDimension: number, thumbnailMaxDimension: number) => {
+  const master = await normalizeStoredImage(uri, masterMaxDimension, STORAGE_IMAGE_JPEG_QUALITY);
+  const thumbnail = await normalizeStoredImage(master.uri, thumbnailMaxDimension, THUMBNAIL_JPEG_QUALITY);
+  return { masterUri: master.uri, thumbnailUri: thumbnail.uri };
 };
 
 const COLORS = {
@@ -263,6 +334,21 @@ const hasUsefulValue = (value = '') => {
   const normalized = normalizedValue(value);
   return Boolean(normalized) && !['no determinable', 'desconocido', 'desconocida', 'sin determinar', 'no identificado', 'no identificada', 'n/a'].includes(normalized);
 };
+const isFootwearItem = (item: Pick<Garment, 'category' | 'subcategory'>) => normalizedValue(`${item.category} ${item.subcategory}`)
+  .split(/\s+/)
+  .some((word) => ['calzado', 'zapatilla', 'zapatillas', 'zapato', 'zapatos', 'bota', 'botas', 'sandalia', 'sandalias', 'mocasin', 'mocasines', 'tacon', 'tacones'].includes(word));
+const duplicateCandidateThreshold = (item: Garment) => {
+  const distinctivePattern = hasUsefulValue(item.pattern) && !['liso', 'sin estampado'].includes(normalizedValue(item.pattern));
+  if (item.brand?.trim() || distinctivePattern) return 0.5;
+  if (isFootwearItem(item)) return 0.58;
+  return 0.62;
+};
+const duplicateVisualThreshold = (item: Garment) => {
+  const distinctivePattern = hasUsefulValue(item.pattern) && !['liso', 'sin estampado'].includes(normalizedValue(item.pattern));
+  if (item.brand?.trim() || distinctivePattern) return 0.64;
+  if (isFootwearItem(item)) return 0.7;
+  return 0.72;
+};
 const keepBestValue = (savedValue: string, candidateValue: string) => hasUsefulValue(savedValue) ? savedValue : candidateValue;
 const unionValues = (first: string[], second: string[]) => Array.from(new Map([...first, ...second].filter(Boolean).map((value) => [normalizedValue(value), value])).values());
 const unionColors = (first: string[], second: string[]) => Array.from(new Map([...first, ...second]
@@ -296,19 +382,53 @@ const OUTFIT_BUCKET = 'outfit-images';
 const toStringArray = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 const isLocalImage = (uri: string) => uri.startsWith('file:') || uri.startsWith('content:');
 
-const uploadGarmentImage = async (userId: string, uri: string, existingPath?: string) => {
-  const file = new File(uri);
-  const content = await file.arrayBuffer();
-  if (!content.byteLength) throw new Error('No hemos podido leer la foto de la prenda.');
-  const path = existingPath || `${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.jpg`;
-  const { error } = await supabase.storage.from(GARMENT_BUCKET).upload(path, content, {
-    contentType: 'image/jpeg',
-    cacheControl: '31536000',
-    upsert: Boolean(existingPath),
-  });
-  if (error) throw new Error(`No hemos podido subir la foto: ${error.message}`);
-  return path;
+type StoredImagePaths = { imagePath: string; thumbnailPath: string };
+const uploadImageVariants = async (
+  bucket: string,
+  userId: string,
+  uri: string,
+  masterMaxDimension: number,
+  thumbnailMaxDimension: number,
+  existingPath?: string,
+  existingThumbnailPath?: string,
+): Promise<StoredImagePaths> => {
+  const variants = await prepareStoredImageVariants(uri, masterMaxDimension, thumbnailMaxDimension);
+  const masterFile = new File(variants.masterUri);
+  const thumbnailFile = new File(variants.thumbnailUri);
+  const [masterContent, thumbnailContent] = await Promise.all([masterFile.arrayBuffer(), thumbnailFile.arrayBuffer()]);
+  if (!masterContent.byteLength || !thumbnailContent.byteLength) throw new Error('No hemos podido preparar la foto para guardarla.');
+  const baseName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const imagePath = existingPath || `${userId}/${baseName}.jpg`;
+  const thumbnailPath = existingThumbnailPath || `${userId}/${baseName}.thumb.jpg`;
+  const [{ error: imageError }, { error: thumbnailError }] = await Promise.all([
+    supabase.storage.from(bucket).upload(imagePath, masterContent, {
+      contentType: 'image/jpeg',
+      cacheControl: '31536000',
+      upsert: Boolean(existingPath),
+    }),
+    supabase.storage.from(bucket).upload(thumbnailPath, thumbnailContent, {
+      contentType: 'image/jpeg',
+      cacheControl: '31536000',
+      upsert: Boolean(existingThumbnailPath),
+    }),
+  ]);
+  if (imageError || thumbnailError) {
+    if (!existingPath && !imageError) await supabase.storage.from(bucket).remove([imagePath]);
+    if (!existingThumbnailPath && !thumbnailError) await supabase.storage.from(bucket).remove([thumbnailPath]);
+    throw new Error(`No hemos podido subir la foto: ${imageError?.message || thumbnailError?.message}`);
+  }
+  return { imagePath, thumbnailPath };
 };
+
+const uploadGarmentImage = (userId: string, uri: string, existingPath?: string, existingThumbnailPath?: string) => uploadImageVariants(
+  GARMENT_BUCKET,
+  userId,
+  uri,
+  GARMENT_STORAGE_MAX_DIMENSION,
+  GARMENT_THUMBNAIL_MAX_DIMENSION,
+  existingPath,
+  existingThumbnailPath,
+);
 
 const signedGarmentUrl = async (path: string) => {
   const { data, error } = await supabase.storage.from(GARMENT_BUCKET).createSignedUrl(path, 60 * 60 * 24);
@@ -316,18 +436,13 @@ const signedGarmentUrl = async (path: string) => {
   return data.signedUrl;
 };
 
-const uploadOutfitImage = async (userId: string, uri: string) => {
-  const file = new File(uri);
-  const content = await file.arrayBuffer();
-  if (!content.byteLength) throw new Error('No hemos podido leer la foto del outfit.');
-  const path = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.jpg`;
-  const { error } = await supabase.storage.from(OUTFIT_BUCKET).upload(path, content, {
-    contentType: 'image/jpeg',
-    cacheControl: '31536000',
-  });
-  if (error) throw new Error(`No hemos podido subir la foto del outfit: ${error.message}`);
-  return path;
-};
+const uploadOutfitImage = (userId: string, uri: string) => uploadImageVariants(
+  OUTFIT_BUCKET,
+  userId,
+  uri,
+  OUTFIT_STORAGE_MAX_DIMENSION,
+  OUTFIT_THUMBNAIL_MAX_DIMENSION,
+);
 
 const signedOutfitUrl = async (path: string) => {
   const { data, error } = await supabase.storage.from(OUTFIT_BUCKET).createSignedUrl(path, 60 * 60 * 24);
@@ -335,7 +450,7 @@ const signedOutfitUrl = async (path: string) => {
   return data.signedUrl;
 };
 
-const garmentPayload = (item: SavedGarment, imagePath: string) => ({
+const garmentPayload = (item: SavedGarment, imagePath: string, thumbnailPath: string | null = item.thumbnailStoragePath || null) => ({
   custom_name: item.customName?.trim() || null,
   category: item.category || '',
   subcategory: item.subcategory || '',
@@ -350,16 +465,19 @@ const garmentPayload = (item: SavedGarment, imagePath: string) => ({
   material_confidence: item.materialConfidence || 0,
   confidence: item.confidence || 0,
   image_path: imagePath,
+  thumbnail_path: thumbnailPath,
   wear_count: item.wearCount || 1,
   scan_fingerprint: item.scanFingerprint
     ? { ...item.scanFingerprint, primaryColor: canonicalColor(item.scanFingerprint.primaryColor) }
     : null,
 });
 
-const rowToSavedGarment = (row: DatabaseGarmentRow, imageUri: string): SavedGarment => ({
+const rowToSavedGarment = (row: DatabaseGarmentRow, imageUri: string, thumbnailUri = imageUri): SavedGarment => ({
   id: row.id,
   imageUri,
+  thumbnailUri,
   storagePath: row.image_path,
+  thumbnailStoragePath: row.thumbnail_path || undefined,
   wearCount: row.wear_count,
   customName: row.custom_name || undefined,
   category: row.category,
@@ -429,6 +547,20 @@ function AnalysisLoading({ visible }: { visible: boolean }) {
       </View>
     </SafeAreaView>
   </Modal>;
+}
+
+function StartupLoading() {
+  return <SafeAreaView style={styles.loadingScreen}>
+    <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} />
+    <LoadingDecorations visible />
+    <View style={styles.loadingContent}>
+      <Text style={styles.loadingEyebrow}>ARMARIO VIRTUAL</Text>
+      <View style={styles.preparationIcon}><Feather name="zap" size={29} color={COLORS.white} /></View>
+      <Text style={styles.loadingTitle}>Preparando tu experiencia</Text>
+      <Text style={styles.loadingText}>Estamos poniendo la inteligencia de tu armario a punto.</Text>
+      <ActivityIndicator size="small" color={COLORS.sageDark} style={styles.loadingSpinner} />
+    </View>
+  </SafeAreaView>;
 }
 
 const preparationMessages = [
@@ -779,7 +911,9 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   const [photoSource, setPhotoSource] = useState<'gallery' | 'camera' | null>(null);
   const [evaluationExpanded, setEvaluationExpanded] = useState(true);
   const [garmentsExpanded, setGarmentsExpanded] = useState(true);
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false);
   const cameraLaunchPending = useRef(false);
+  const duplicateChecksRef = useRef<{ key: string; promise: Promise<PreparedDuplicateChecks> } | null>(null);
 
   const chooseFromGallery = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -814,6 +948,8 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       setExcludedGarments([]);
       setDuplicateReview(null);
       setDuplicateIndex(0);
+      duplicateChecksRef.current = null;
+      setCheckingDuplicates(false);
       setOutfitEvaluation(null);
       setStyleGoal(null);
       setYoungChildDetected(false);
@@ -851,7 +987,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         setPhotoDate(metadataDate ? parsePhotoDate(metadataDate as string | number) : new Date().toISOString());
         setAskForPhotoDate(false);
         setManualPhotoDate('');
-        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); setOutfitEvaluation(null); setStyleGoal(null); setYoungChildDetected(false); setStage('upload');
+        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); duplicateChecksRef.current = null; setCheckingDuplicates(false); setOutfitEvaluation(null); setStyleGoal(null); setYoungChildDetected(false); setStage('upload');
         setNoOutfitFound(false);
       }
     } catch (error) {
@@ -930,9 +1066,9 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       const form = new FormData();
       form.append('styleGoal', styleGoal);
       form.append('photo', { uri: aiImage.uri, name: 'outfit.jpg', type: aiImage.uri === imageUri ? imageType : 'image/jpeg' } as unknown as Blob);
-      const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
+      await waitForBackendWarmup();
       requestStartedAt = Date.now();
-      const response = await fetch(`${apiUrl}/analyze-outfit`, { method: 'POST', body: form });
+      const response = await fetch(`${API_URL}/analyze-outfit`, { method: 'POST', body: form });
       httpStatus = response.status;
       const payload = await response.json();
       requestDurationMs = Date.now() - requestStartedAt;
@@ -1062,17 +1198,165 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
     }
   };
 
-  const compareGarmentPhotos = async (candidateUri: string, savedUri: string): Promise<GarmentComparison> => {
+  const compareGarmentPhotos = async (candidateUri: string, saved: SavedGarment): Promise<GarmentComparison> => {
     const startedAt = Date.now();
+    const { data: { session: activeSession } } = await supabase.auth.getSession();
+    if (!activeSession?.access_token) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
     const form = new FormData();
     form.append('candidate', { uri: candidateUri, name: 'candidate.jpg', type: 'image/jpeg' } as unknown as Blob);
-    form.append('saved', { uri: savedUri, name: 'saved.jpg', type: 'image/jpeg' } as unknown as Blob);
-    const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
-    const response = await fetch(`${apiUrl}/compare-garments`, { method: 'POST', body: form });
+    form.append('savedGarmentId', saved.id);
+    await waitForBackendWarmup();
+    const response = await fetch(`${API_URL}/compare-garments`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${activeSession.access_token}` },
+      body: form,
+    });
     const payload = await response.json();
     const result = { ...payload, clientDurationMs: Date.now() - startedAt, httpStatus: response.status } as GarmentComparison;
     if (!response.ok) throw Object.assign(new Error(payload.error || 'No se han podido comparar las fotos.'), { comparison: result });
     return result;
+  };
+
+  const duplicateCheckKey = (items: Garment[]) => JSON.stringify({
+    imageUri,
+    items: items.map((item) => ({
+      category: item.category,
+      subcategory: item.subcategory,
+      primaryColor: item.primaryColor,
+      secondaryColors: item.secondaryColors,
+      styles: item.styles,
+      pattern: item.pattern,
+      brand: item.brand,
+      fabricType: item.fabricType,
+      itemBox: item.itemBox,
+      displayRotation: item.displayRotation,
+    })),
+    wardrobe: wardrobeItems.map((item) => ({ id: item.id, imageUri: item.imageUri, fingerprint: item.scanFingerprint || null })),
+  });
+
+  const runDuplicateChecks = async (includedGarments: Garment[], key: string): Promise<PreparedDuplicateChecks> => {
+    const preparationStartedAt = Date.now();
+    const temporaryIdPrefix = Date.now();
+    const croppedItems = await Promise.all(includedGarments.map(async (item, index) => ({
+      ...item,
+      id: `${temporaryIdPrefix}-${index}`,
+      imageUri: await cropGarment(item),
+      wearCount: 1,
+      scanFingerprint: {
+        category: item.category,
+        subcategory: item.subcategory,
+        primaryColor: canonicalColor(item.primaryColor),
+        brand: item.brand,
+        pattern: item.pattern,
+        fabricType: item.fabricType,
+        styles: [...item.styles],
+      },
+    })));
+    const preparationDurationMs = Date.now() - preparationStartedAt;
+    const comparisonTargets = croppedItems.flatMap((candidate) => wardrobeItems
+      .map((saved) => ({ saved, score: duplicateScore(candidate, saved) }))
+      .filter(({ score }) => score >= duplicateCandidateThreshold(candidate))
+      .sort((first, second) => second.score - first.score)
+      .slice(0, 3)
+      .map((closest) => ({ candidate, closest })));
+    const comparisonsStartedAt = Date.now();
+    const comparisonResults = await mapWithConcurrency<typeof comparisonTargets[number], DuplicateComparisonResult>(comparisonTargets, 2, async ({ candidate, closest }) => {
+      try {
+        const visual = await compareGarmentPhotos(candidate.imageUri, closest.saved);
+        let match: DuplicateMatch | null = null;
+        if (visual.sameGarment && visual.confidence >= duplicateVisualThreshold(candidate)) {
+          match = {
+            candidateId: candidate.id,
+            candidate,
+            saved: closest.saved,
+            bestImage: visual.bestImage || 'saved',
+            confidence: visual.confidence,
+            reason: visual.reason,
+            metadataScore: closest.score,
+            source: 'visual',
+          };
+        } else if (closest.score >= 0.9) {
+          match = {
+            candidateId: candidate.id,
+            candidate,
+            saved: closest.saved,
+            bestImage: visual.bestImage || 'saved',
+            confidence: visual.confidence,
+            reason: `Los datos de ambas prendas son muy parecidos, pero la comparación visual no la ha confirmado. ${visual.reason || ''}`.trim(),
+            metadataScore: closest.score,
+            source: 'metadata',
+          };
+        }
+        return { match, comparison: visual, failed: false };
+      } catch (error) {
+        const metadataMatch = closest.score >= 0.9 ? {
+          candidateId: candidate.id,
+          candidate,
+          saved: closest.saved,
+          bestImage: 'saved' as const,
+          confidence: 0,
+          reason: 'Los datos de ambas prendas son muy parecidos, pero no hemos podido completar la comprobación visual.',
+          metadataScore: closest.score,
+          source: 'metadata' as const,
+        } : null;
+        return {
+          match: metadataMatch,
+          comparison: (error as Error & { comparison?: GarmentComparison }).comparison,
+          failed: true,
+        };
+      }
+    });
+    const comparisonsDurationMs = Date.now() - comparisonsStartedAt;
+    const comparisonMetas = comparisonResults.map((result) => result.comparison?._analysisMeta).filter((meta): meta is AnalysisMeta => Boolean(meta));
+    const sumMetric = (values: Array<number | null | undefined>) => values.reduce<number>((total, value) => total + (value || 0), 0);
+    const requestDurationMs = sumMetric(comparisonResults.map((result) => result.comparison?.clientDurationMs));
+    const serverDurationMs = sumMetric(comparisonMetas.map((meta) => meta.serverDurationMs));
+    recordAnalysisRun({
+      analysis_type: 'duplicate_batch',
+      status: comparisonResults.some((result) => result.failed) ? 'failed' : 'completed',
+      client_duration_ms: comparisonsDurationMs,
+      preparation_duration_ms: preparationDurationMs,
+      request_duration_ms: requestDurationMs,
+      network_duration_ms: Math.max(0, requestDurationMs - serverDurationMs),
+      server_duration_ms: serverDurationMs,
+      provider_duration_ms: sumMetric(comparisonMetas.map((meta) => meta.providerDurationMs)),
+      image_size_bytes: sumMetric(comparisonMetas.map((meta) => (meta.candidateBytes || 0) + (meta.savedBytes || 0))),
+      comparison_count: comparisonTargets.length,
+      comparison_failure_count: comparisonResults.filter((result) => result.failed).length,
+      cache_hit_count: comparisonMetas.filter((meta) => meta.cacheHit).length,
+      provider_call_count: comparisonMetas.filter((meta) => !meta.cacheHit && (meta.providerAttemptCount || 0) > 0).length,
+      provider_attempt_count: sumMetric(comparisonMetas.map((meta) => meta.providerAttemptCount)),
+      fallback_used: comparisonMetas.some((meta) => meta.fallbackUsed),
+      model: comparisonMetas.find((meta) => meta.model)?.model || null,
+    });
+    const bestMatchByCandidate = new Map<string, DuplicateMatch>();
+    for (const result of comparisonResults) {
+      if (!result.match) continue;
+      const previous = bestMatchByCandidate.get(result.match.candidateId);
+      const visualBeatsMetadata = result.match.source === 'visual' && previous?.source === 'metadata';
+      const sameSourceAndStronger = previous?.source === result.match.source
+        && (result.match.confidence > previous.confidence
+          || (result.match.confidence === previous.confidence && result.match.metadataScore > previous.metadataScore));
+      if (!previous || visualBeatsMetadata || sameSourceAndStronger) {
+        bestMatchByCandidate.set(result.match.candidateId, result.match);
+      }
+    }
+    const matches = croppedItems.map((item) => bestMatchByCandidate.get(item.id)).filter((match): match is DuplicateMatch => Boolean(match));
+    return { key, croppedItems, matches };
+  };
+
+  const startDuplicateChecks = (includedGarments: Garment[]) => {
+    const key = duplicateCheckKey(includedGarments);
+    if (duplicateChecksRef.current?.key === key) return duplicateChecksRef.current.promise;
+    const promise = runDuplicateChecks(includedGarments, key);
+    duplicateChecksRef.current = { key, promise };
+    setCheckingDuplicates(true);
+    void promise.catch((error) => {
+      console.warn('[Duplicados] No se ha podido completar la comprobación anticipada:', error);
+    }).finally(() => {
+      if (duplicateChecksRef.current?.promise === promise) setCheckingDuplicates(false);
+    });
+    return promise;
   };
 
   const saveGarments = async () => {
@@ -1083,73 +1367,9 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       return;
     }
     setSaving(true);
-    const preparationStartedAt = Date.now();
     try {
-      let croppedItems = await Promise.all(includedGarments.map(async (item, index) => ({
-        ...item,
-        id: `${Date.now()}-${index}`,
-        imageUri: await cropGarment(item),
-        wearCount: 1,
-        scanFingerprint: {
-          category: item.category,
-          subcategory: item.subcategory,
-          primaryColor: canonicalColor(item.primaryColor),
-          brand: item.brand,
-          pattern: item.pattern,
-          fabricType: item.fabricType,
-          styles: [...item.styles],
-        },
-      })));
-      const preparationDurationMs = Date.now() - preparationStartedAt;
-      const comparisonTargets = croppedItems.flatMap((candidate) => {
-        const metadataCandidates = wardrobeItems
-          .map((saved) => ({ saved, score: duplicateScore(candidate, saved) }))
-          .filter(({ score }) => score >= 0.55)
-          .sort((first, second) => second.score - first.score)
-          .slice(0, 1);
-        const closest = metadataCandidates[0];
-        return closest ? [{ candidate, closest }] : [];
-      });
-      const comparisonsStartedAt = Date.now();
-      const comparisonResults = await mapWithConcurrency(comparisonTargets, 2, async ({ candidate, closest }) => {
-        try {
-          const visual = await compareGarmentPhotos(candidate.imageUri, closest.saved.imageUri);
-          const match = (visual.sameGarment && visual.confidence >= 0.6) || closest.score >= 0.8
-            ? { candidateId: candidate.id, candidate, saved: closest.saved, bestImage: visual.bestImage || 'saved' } as DuplicateMatch
-            : null;
-          return { match, comparison: visual, failed: false };
-        } catch (error) {
-          const comparison = (error as Error & { comparison?: GarmentComparison }).comparison;
-          const match = closest.score >= 0.85
-            ? { candidateId: candidate.id, candidate, saved: closest.saved, bestImage: 'saved' } as DuplicateMatch
-            : null;
-          return { match, comparison, failed: true };
-        }
-      });
-      const comparisonsDurationMs = Date.now() - comparisonsStartedAt;
-      const comparisonMetas = comparisonResults.map((result) => result.comparison?._analysisMeta).filter((meta): meta is AnalysisMeta => Boolean(meta));
-      const sumMetric = (values: Array<number | null | undefined>) => values.reduce<number>((total, value) => total + (value || 0), 0);
-      const requestDurationMs = sumMetric(comparisonResults.map((result) => result.comparison?.clientDurationMs));
-      const serverDurationMs = sumMetric(comparisonMetas.map((meta) => meta.serverDurationMs));
-      recordAnalysisRun({
-        analysis_type: 'duplicate_batch',
-        status: comparisonResults.some((result) => result.failed) ? 'failed' : 'completed',
-        client_duration_ms: comparisonsDurationMs,
-        preparation_duration_ms: preparationDurationMs,
-        request_duration_ms: requestDurationMs,
-        network_duration_ms: Math.max(0, requestDurationMs - serverDurationMs),
-        server_duration_ms: serverDurationMs,
-        provider_duration_ms: sumMetric(comparisonMetas.map((meta) => meta.providerDurationMs)),
-        image_size_bytes: sumMetric(comparisonMetas.map((meta) => (meta.candidateBytes || 0) + (meta.savedBytes || 0))),
-        comparison_count: comparisonTargets.length,
-        comparison_failure_count: comparisonResults.filter((result) => result.failed).length,
-        cache_hit_count: comparisonMetas.filter((meta) => meta.cacheHit).length,
-        provider_call_count: comparisonMetas.filter((meta) => !meta.cacheHit && (meta.providerAttemptCount || 0) > 0).length,
-        provider_attempt_count: sumMetric(comparisonMetas.map((meta) => meta.providerAttemptCount)),
-        fallback_used: comparisonMetas.some((meta) => meta.fallbackUsed),
-        model: comparisonMetas.find((meta) => meta.model)?.model || null,
-      });
-      const visualMatches = comparisonResults.map((result) => result.match).filter((match): match is DuplicateMatch => match !== null);
+      const preparedChecks = await startDuplicateChecks(includedGarments);
+      const { croppedItems, matches: visualMatches } = preparedChecks;
       if (visualMatches.length > 0) {
         setSaving(false);
         setDuplicateReview({
@@ -1170,6 +1390,16 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       setSaving(false);
     }
   };
+
+  useEffect(() => {
+    if (stage !== 'review' || !imageUri || garments.length === 0 || saving) return undefined;
+    const includedGarments = garments.filter((_item, index) => !excludedGarments.includes(index));
+    if (includedGarments.length === 0) return undefined;
+    const timer = setTimeout(() => {
+      void startDuplicateChecks(includedGarments);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [stage, imageUri, garments, excludedGarments, wardrobeItems, saving]);
 
   const renderPeoplePicker = () => <View style={styles.peoplePicker}>
     <View style={styles.peoplePickerIcon}><Feather name="users" size={20} color={COLORS.sageDark} /></View>
@@ -1227,8 +1457,9 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       </View>;
     })}
     <TouchableOpacity style={[styles.saveButton, saving && styles.buttonDisabled]} onPress={saveGarments} disabled={saving}>
-      {saving ? <ActivityIndicator color={COLORS.white} /> : <Feather name="check" size={19} color={COLORS.white} />}<Text style={styles.saveButtonText}>{saving ? 'Preparando prendas…' : `Guardar ${garments.length - excludedGarments.length} prendas`}</Text>
+      {saving ? <ActivityIndicator color={COLORS.white} /> : <Feather name="check" size={19} color={COLORS.white} />}<Text style={styles.saveButtonText}>{saving ? (checkingDuplicates ? 'Comprobando duplicados…' : 'Guardando prendas…') : `Guardar ${garments.length - excludedGarments.length} prendas`}</Text>
     </TouchableOpacity>
+    {checkingDuplicates && !saving && <View style={styles.backgroundCheck}><ActivityIndicator size="small" color={COLORS.sageDark} /><Text style={styles.backgroundCheckText}>Buscando posibles duplicados mientras revisas…</Text></View>}
       </>}
     </View>
   </View>;
@@ -1270,6 +1501,10 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         <View style={styles.comparisonColumn}><Text style={styles.comparisonLabel}>EN TU ARMARIO</Text><TouchableOpacity activeOpacity={0.9} onPress={() => setComparisonFullScreenImage(match.saved.imageUri)}><View><Image source={{ uri: match.saved.imageUri }} style={styles.comparisonImage} />{match.bestImage === 'saved' && <View style={styles.bestPhotoBadge}><Feather name="star" size={9} color={COLORS.white} /><Text style={styles.bestPhotoBadgeText}>Mejor foto</Text></View>}</View></TouchableOpacity><Text style={styles.comparisonName}>{garmentTitle(match.saved)}</Text><Text style={styles.comparisonUses}>{match.saved.wearCount || 1} {(match.saved.wearCount || 1) === 1 ? 'uso' : 'usos'}</Text></View>
       </View>
       <View style={styles.duplicateClues}><Feather name="search" size={17} color={COLORS.sageDark} /><Text style={styles.duplicateCluesText}>Fíjate en el corte, costuras, logotipo, estampado, tipo de tejido y textura.</Text></View>
+      <View style={styles.duplicateReason}>
+        <Text style={styles.duplicateReasonTitle}>{match.source === 'visual' ? `COINCIDENCIA VISUAL · ${Math.round(match.confidence * 100)}%` : 'POSIBLE COINCIDENCIA POR DATOS'}</Text>
+        <Text style={styles.duplicateReasonText}>{match.reason || 'Las dos fotos presentan detalles visuales compatibles.'}</Text>
+      </View>
       <TouchableOpacity style={styles.sameGarmentButton} onPress={() => resolveDuplicate(true)}><Feather name="repeat" size={18} color={COLORS.white} /><View><Text style={styles.sameGarmentButtonTitle}>Es la misma</Text><Text style={styles.sameGarmentButtonText}>Sumar un uso y no duplicar</Text></View></TouchableOpacity>
       <TouchableOpacity style={styles.differentGarmentButton} onPress={() => resolveDuplicate(false)}><Feather name="copy" size={18} color={COLORS.sageDark} /><View><Text style={styles.differentGarmentButtonTitle}>Es distinta</Text><Text style={styles.differentGarmentButtonText}>Guardar como una prenda nueva</Text></View></TouchableOpacity>
     </ScrollView><Modal visible={comparisonFullScreenImage !== null} transparent animationType="fade" onRequestClose={() => setComparisonFullScreenImage(null)}><View style={{ flex: 1, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center' }}><TouchableOpacity onPress={() => setComparisonFullScreenImage(null)} style={{ position: 'absolute', top: 52, right: 20, zIndex: 2, width: 42, height: 42, borderRadius: 21, backgroundColor: 'rgba(255,255,255,0.9)', alignItems: 'center', justifyContent: 'center' }}><Feather name="x" size={22} color={COLORS.ink} /></TouchableOpacity>{comparisonFullScreenImage && <Image source={{ uri: comparisonFullScreenImage }} resizeMode="contain" style={{ width: '100%', height: '100%' }} />}</View></Modal></>;
@@ -1403,21 +1638,35 @@ function Wardrobe({ items, initialCategory, onDelete, onMerge, onUpdate }: { ite
     </TouchableOpacity>)}
   </View>;
 
-  return <ScrollView contentContainerStyle={styles.wardrobeScroll} showsVerticalScrollIndicator={false}>
-    <View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>MI COLECCIÓN</Text><Text style={styles.title}>Tu armario</Text><Text style={styles.addIntro}>{items.length} prendas guardadas en esta sesión.</Text></View>
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryFilters}>
-      <TouchableOpacity style={[styles.categoryFilter, selectedCategories.length === 0 && styles.categoryFilterActive]} onPress={() => setSelectedCategories([])}>
-        <Text style={[styles.categoryFilterText, selectedCategories.length === 0 && styles.categoryFilterTextActive]}>Todas</Text><Text style={[styles.categoryFilterCount, selectedCategories.length === 0 && styles.categoryFilterTextActive]}>{items.length}</Text>
-      </TouchableOpacity>
-      {orderedCategories.map(([key, category]) => <TouchableOpacity key={key} style={[styles.categoryFilter, selectedCategories.includes(key) && styles.categoryFilterActive]} onPress={() => setSelectedCategories((current) => current.includes(key) ? current.filter((categoryKey) => categoryKey !== key) : [...current, key])}>
-        <Text style={[styles.categoryFilterText, selectedCategories.includes(key) && styles.categoryFilterTextActive]}>{category.label}</Text><Text style={[styles.categoryFilterCount, selectedCategories.includes(key) && styles.categoryFilterTextActive]}>{category.count}</Text>
-      </TouchableOpacity>)}
-    </ScrollView>
-    <View style={styles.filterSummary}><Text style={styles.filteredCount}>{visibleItems.length} {visibleItems.length === 1 ? 'prenda' : 'prendas'}</Text><TouchableOpacity style={[styles.filterButton, activeFilterCount > 0 && styles.filterButtonActive]} onPress={() => setFiltersOpen(true)}><Feather name="sliders" size={15} color={activeFilterCount > 0 ? COLORS.white : COLORS.sageDark} /><Text style={[styles.filterButtonText, activeFilterCount > 0 && styles.filterButtonTextActive]}>Filtros{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}</Text></TouchableOpacity></View>
-    <View style={styles.wardrobeGrid}>{visibleItems.map((item) => <TouchableOpacity key={item.id} style={styles.wardrobeItem} activeOpacity={0.84} onPress={() => setSelectedItem(item)}>
-      <Image source={{ uri: item.imageUri }} style={styles.wardrobeImage} />
-      <View style={styles.wardrobeInfo}><Text style={styles.wardrobeName}>{garmentTitle(item)}</Text><Text style={styles.wardrobeMeta}>{item.primaryColor} · {item.pattern}</Text><Text style={styles.wardrobeMaterial}>{item.fabricType} · {item.texture}</Text><View style={styles.wardrobeCardFooter}><View style={styles.stylePill}><Text style={styles.stylePillText}>{item.styles[0] || 'Sin estilo'}</Text></View><View style={styles.wearBadge}><Text style={styles.wearBadgeText}>{item.wearCount || 1}×</Text></View></View></View>
-    </TouchableOpacity>)}</View>
+  return <>
+    <FlatList
+      data={visibleItems}
+      keyExtractor={(item) => item.id}
+      numColumns={2}
+      initialNumToRender={8}
+      maxToRenderPerBatch={8}
+      windowSize={5}
+      removeClippedSubviews={Platform.OS !== 'web'}
+      contentContainerStyle={styles.wardrobeScroll}
+      columnWrapperStyle={styles.wardrobeGridRow}
+      showsVerticalScrollIndicator={false}
+      ListHeaderComponent={<>
+        <View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>MI COLECCIÓN</Text><Text style={styles.title}>Tu armario</Text><Text style={styles.addIntro}>{items.length} prendas guardadas en esta sesión.</Text></View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryFilters}>
+          <TouchableOpacity style={[styles.categoryFilter, selectedCategories.length === 0 && styles.categoryFilterActive]} onPress={() => setSelectedCategories([])}>
+            <Text style={[styles.categoryFilterText, selectedCategories.length === 0 && styles.categoryFilterTextActive]}>Todas</Text><Text style={[styles.categoryFilterCount, selectedCategories.length === 0 && styles.categoryFilterTextActive]}>{items.length}</Text>
+          </TouchableOpacity>
+          {orderedCategories.map(([key, category]) => <TouchableOpacity key={key} style={[styles.categoryFilter, selectedCategories.includes(key) && styles.categoryFilterActive]} onPress={() => setSelectedCategories((current) => current.includes(key) ? current.filter((categoryKey) => categoryKey !== key) : [...current, key])}>
+            <Text style={[styles.categoryFilterText, selectedCategories.includes(key) && styles.categoryFilterTextActive]}>{category.label}</Text><Text style={[styles.categoryFilterCount, selectedCategories.includes(key) && styles.categoryFilterTextActive]}>{category.count}</Text>
+          </TouchableOpacity>)}
+        </ScrollView>
+        <View style={styles.filterSummary}><Text style={styles.filteredCount}>{visibleItems.length} {visibleItems.length === 1 ? 'prenda' : 'prendas'}</Text><TouchableOpacity style={[styles.filterButton, activeFilterCount > 0 && styles.filterButtonActive]} onPress={() => setFiltersOpen(true)}><Feather name="sliders" size={15} color={activeFilterCount > 0 ? COLORS.white : COLORS.sageDark} /><Text style={[styles.filterButtonText, activeFilterCount > 0 && styles.filterButtonTextActive]}>Filtros{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}</Text></TouchableOpacity></View>
+      </>}
+      renderItem={({ item }) => <TouchableOpacity style={styles.wardrobeItem} activeOpacity={0.84} onPress={() => setSelectedItem(item)}>
+        <CachedImage source={{ uri: item.thumbnailUri || item.imageUri }} style={styles.wardrobeImage} contentFit="cover" cachePolicy="memory-disk" transition={120} recyclingKey={item.id} />
+        <View style={styles.wardrobeInfo}><Text style={styles.wardrobeName}>{garmentTitle(item)}</Text><Text style={styles.wardrobeMeta}>{item.primaryColor} · {item.pattern}</Text><Text style={styles.wardrobeMaterial}>{item.fabricType} · {item.texture}</Text><View style={styles.wardrobeCardFooter}><View style={styles.stylePill}><Text style={styles.stylePillText}>{item.styles[0] || 'Sin estilo'}</Text></View><View style={styles.wearBadge}><Text style={styles.wearBadgeText}>{item.wearCount || 1}×</Text></View></View></View>
+      </TouchableOpacity>}
+    />
     <Modal visible={filtersOpen} transparent animationType="slide" onRequestClose={() => setFiltersOpen(false)}>
       <View style={styles.filterModalBackdrop}>
         <TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setFiltersOpen(false)} />
@@ -1437,7 +1686,7 @@ function Wardrobe({ items, initialCategory, onDelete, onMerge, onUpdate }: { ite
         <TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedItem(null)} />
         {selectedItem && <View style={styles.garmentDetail}>
           <View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DE PRENDA</Text><Text style={styles.garmentDetailTitle}>{garmentTitle(selectedItem)}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedItem(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View>
-          <Image source={{ uri: selectedItem.imageUri }} style={styles.garmentDetailImage} />
+          <CachedImage source={{ uri: selectedItem.imageUri }} style={styles.garmentDetailImage} contentFit="cover" cachePolicy="memory-disk" transition={120} />
           <View style={styles.wearSummary}><View style={styles.wearSummaryIcon}><Feather name="repeat" size={21} color={COLORS.sageDark} /></View><View><Text style={styles.wearSummaryCount}>{selectedItem.wearCount || 1} {(selectedItem.wearCount || 1) === 1 ? 'uso' : 'usos'}</Text><Text style={styles.wearSummaryText}>Te la has puesto {(selectedItem.wearCount || 1) === 1 ? 'una vez' : `${selectedItem.wearCount} veces`}</Text></View></View>
           <Text style={styles.garmentDetailMeta}>{selectedItem.primaryColor} · {selectedItem.pattern} · {selectedItem.fabricType} · {selectedItem.texture}{hasUsefulValue(selectedItem.materialEstimate) ? ` · Composición aparente: ${selectedItem.materialEstimate}` : ''}</Text>
           <View style={styles.detailActions}><TouchableOpacity style={styles.editGarmentButton} onPress={() => { setEditingItem({ ...selectedItem, styles: [...selectedItem.styles], secondaryColors: [...selectedItem.secondaryColors] }); setSelectedItem(null); }}><Feather name="edit-2" size={17} color={COLORS.white} /><Text style={styles.editGarmentButtonText}>Editar nombre y características</Text></TouchableOpacity><TouchableOpacity style={styles.rotateImageButton} onPress={() => void rotateWardrobeImage(selectedItem)}><Feather name="rotate-cw" size={17} color={COLORS.sageDark} /><Text style={styles.mergeButtonText}>Girar</Text></TouchableOpacity><TouchableOpacity style={styles.mergeButton} onPress={() => { setMergeSource(selectedItem); setSelectedItem(null); }}><Feather name="git-merge" size={17} color={COLORS.sageDark} /><Text style={styles.mergeButtonText}>Fusionar</Text></TouchableOpacity><TouchableOpacity style={styles.deleteButton} onPress={() => confirmDelete(selectedItem)}><Feather name="trash-2" size={17} color="#A54E43" /><Text style={styles.deleteButtonText}>Eliminar</Text></TouchableOpacity></View>
@@ -1450,7 +1699,7 @@ function Wardrobe({ items, initialCategory, onDelete, onMerge, onUpdate }: { ite
         {mergeSource && <View style={styles.mergeSheet}>
           <View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>FUSIONAR PRENDAS</Text><Text style={styles.filterModalTitle}>Elige la ficha duplicada</Text><Text style={styles.filterModalSubtitle}>Conservaremos “{garmentTitle(mergeSource)}” como ficha principal.</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setMergeSource(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View>
           <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.mergeList}>
-            {items.filter((item) => item.id !== mergeSource.id).map((item) => <TouchableOpacity key={item.id} style={styles.mergeOption} onPress={() => confirmMerge(mergeSource, item)}><Image source={{ uri: item.imageUri }} style={styles.mergeOptionImage} /><View style={styles.mergeOptionCopy}><Text style={styles.mergeOptionTitle}>{garmentTitle(item)}</Text><Text style={styles.mergeOptionMeta}>{item.wearCount || 1} {(item.wearCount || 1) === 1 ? 'uso' : 'usos'} · {item.fabricType} · {item.texture}</Text></View><Feather name="chevron-right" size={19} color={COLORS.muted} /></TouchableOpacity>)}
+            {items.filter((item) => item.id !== mergeSource.id).map((item) => <TouchableOpacity key={item.id} style={styles.mergeOption} onPress={() => confirmMerge(mergeSource, item)}><CachedImage source={{ uri: item.thumbnailUri || item.imageUri }} style={styles.mergeOptionImage} contentFit="cover" cachePolicy="memory-disk" recyclingKey={item.id} /><View style={styles.mergeOptionCopy}><Text style={styles.mergeOptionTitle}>{garmentTitle(item)}</Text><Text style={styles.mergeOptionMeta}>{item.wearCount || 1} {(item.wearCount || 1) === 1 ? 'uso' : 'usos'} · {item.fabricType} · {item.texture}</Text></View><Feather name="chevron-right" size={19} color={COLORS.muted} /></TouchableOpacity>)}
             {items.length === 1 && <Text style={styles.noMergeOptions}>No hay otra prenda con la que fusionarla.</Text>}
           </ScrollView>
         </View>}
@@ -1476,7 +1725,7 @@ function Wardrobe({ items, initialCategory, onDelete, onMerge, onUpdate }: { ite
     <Modal visible={fixedPicker !== null} transparent animationType="fade" onRequestClose={() => setFixedPicker(null)}>
       <View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setFixedPicker(null)} /><View style={styles.mergeSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>EDITAR PRENDA</Text><Text style={styles.filterModalTitle}>{fixedPicker === 'category' ? 'Categoría' : 'Tipo de prenda'}</Text><Text style={styles.filterModalSubtitle}>Selecciona una opción</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setFixedPicker(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView contentContainerStyle={styles.mergeList}>{(fixedPicker === 'category' ? FIXED_CATEGORIES : FIXED_TYPES).map((option) => { const selected = editingItem?.[fixedPicker] === option; return <TouchableOpacity key={option} style={[styles.mergeOption, selected && styles.categoryFilterActive]} onPress={() => { if (editingItem && fixedPicker) setEditingItem({ ...editingItem, [fixedPicker]: option }); setFixedPicker(null); }}><Text style={[styles.mergeOptionTitle, selected && styles.categoryFilterTextActive]}>{option.charAt(0).toLocaleUpperCase('es') + option.slice(1)}</Text>{selected && <Feather name="check" size={17} color={COLORS.white} />}</TouchableOpacity>; })}</ScrollView></View></View>
     </Modal>
-  </ScrollView>;
+  </>;
 }
 
 type HomeCategory = { key: string; label: string; count: number; imageUris: string[] };
@@ -1489,7 +1738,7 @@ function OutfitHistoryCard({ outfit, onOpen, onDelete, showOutfitScore }: { outf
     ? Animated.timing(translateX, { toValue: -420, duration: 180, useNativeDriver: true }).start(onDelete)
     : Animated.spring(translateX, { toValue: 0, useNativeDriver: true }).start();
   const deleteControl = <TouchableOpacity onPress={onDelete} style={{ width: 92, height: 112, alignItems: 'center', justifyContent: 'center' }}><Feather name="trash-2" size={20} color={COLORS.white} /><Text style={{ color: COLORS.white, fontSize: 10, fontWeight: '800', marginTop: 5 }}>Eliminar</Text></TouchableOpacity>;
-  return <View style={{ height: 112, maxHeight: 112, flexGrow: 0, flexShrink: 0, marginBottom: 11, borderRadius: 18, overflow: 'hidden', backgroundColor: '#C95F55', flexDirection: 'row', justifyContent: 'space-between' }}>{deleteControl}{deleteControl}<Animated.View style={{ position: 'absolute', left: 0, right: 0, top: 0, height: 112, transform: [{ translateX }] }}><SwipeTouchable activeOpacity={0.86} onTouchStart={(event: any) => { startX.current = event.nativeEvent.pageX; horizontalGesture.current = false; }} onTouchMove={(event: any) => { const distance = event.nativeEvent.pageX - startX.current; if (Math.abs(distance) > 12) { horizontalGesture.current = true; translateX.setValue(Math.max(-92, Math.min(92, distance))); } }} onTouchEnd={(event: any) => { if (horizontalGesture.current) settleSwipe(event.nativeEvent.pageX - startX.current); }} onPress={() => { if (!horizontalGesture.current) onOpen(); horizontalGesture.current = false; }} style={{ flex: 1, backgroundColor: COLORS.white, flexDirection: 'row' }}><Image source={{ uri: outfit.imageUri }} style={{ width: 96, height: 112, backgroundColor: COLORS.sand }} /><View style={{ flex: 1, padding: 13, justifyContent: 'center' }}><Text style={styles.cardTitle}>{new Date(outfit.createdAt).toLocaleDateString('es-ES')}</Text>{outfit.evaluation && <>{showOutfitScore && <Text style={{ color: COLORS.sageDark, fontSize: 19, fontWeight: '800', marginTop: 5 }}>{Math.round(outfit.evaluation.score)}/100</Text>}<Text numberOfLines={2} style={[styles.reviewHint, { marginTop: showOutfitScore ? 4 : 7, marginBottom: 0 }]}>{outfit.evaluation.summary}</Text></>}<Feather name="chevron-right" size={18} color={COLORS.muted} style={{ position: 'absolute', right: 12, top: 13 }} /></View></SwipeTouchable></Animated.View></View>;
+  return <View style={{ height: 112, maxHeight: 112, flexGrow: 0, flexShrink: 0, marginBottom: 11, borderRadius: 18, overflow: 'hidden', backgroundColor: '#C95F55', flexDirection: 'row', justifyContent: 'space-between' }}>{deleteControl}{deleteControl}<Animated.View style={{ position: 'absolute', left: 0, right: 0, top: 0, height: 112, transform: [{ translateX }] }}><SwipeTouchable activeOpacity={0.86} onTouchStart={(event: any) => { startX.current = event.nativeEvent.pageX; horizontalGesture.current = false; }} onTouchMove={(event: any) => { const distance = event.nativeEvent.pageX - startX.current; if (Math.abs(distance) > 12) { horizontalGesture.current = true; translateX.setValue(Math.max(-92, Math.min(92, distance))); } }} onTouchEnd={(event: any) => { if (horizontalGesture.current) settleSwipe(event.nativeEvent.pageX - startX.current); }} onPress={() => { if (!horizontalGesture.current) onOpen(); horizontalGesture.current = false; }} style={{ flex: 1, backgroundColor: COLORS.white, flexDirection: 'row' }}><CachedImage source={{ uri: outfit.thumbnailUri || outfit.imageUri }} style={{ width: 96, height: 112, backgroundColor: COLORS.sand }} contentFit="cover" cachePolicy="memory-disk" transition={120} recyclingKey={outfit.id} /><View style={{ flex: 1, padding: 13, justifyContent: 'center' }}><Text style={styles.cardTitle}>{new Date(outfit.createdAt).toLocaleDateString('es-ES')}</Text>{outfit.evaluation && <>{showOutfitScore && <Text style={{ color: COLORS.sageDark, fontSize: 19, fontWeight: '800', marginTop: 5 }}>{Math.round(outfit.evaluation.score)}/100</Text>}<Text numberOfLines={2} style={[styles.reviewHint, { marginTop: showOutfitScore ? 4 : 7, marginBottom: 0 }]}>{outfit.evaluation.summary}</Text></>}<Feather name="chevron-right" size={18} color={COLORS.muted} style={{ position: 'absolute', right: 12, top: 13 }} /></View></SwipeTouchable></Animated.View></View>;
 }
 
 function Outfits({ outfits, onDelete, onRestore, onDeletePermanent, showOutfitScore, showImprovementPoints }: { outfits: SavedOutfit[]; onDelete: (id: string) => void; onRestore: (outfit: SavedOutfit) => void; onDeletePermanent: (outfit: SavedOutfit) => Promise<void>; showOutfitScore: boolean; showImprovementPoints: boolean }) {
@@ -1528,35 +1777,16 @@ function Outfits({ outfits, onDelete, onRestore, onDeletePermanent, showOutfitSc
     setRecentlyDeleted(null);
   };
   return <>
-    <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}><View style={{ height: 18 }} /><View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>HISTORIAL</Text><Text style={styles.title}>Tus outfits</Text><Text style={styles.addIntro}>{outfits.length} outfits analizados.</Text></View><View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}><TouchableOpacity onPress={() => setSortBy('date')} style={[styles.categoryFilter, sortBy === 'date' && styles.categoryFilterActive]}><Feather name="calendar" size={14} color={sortBy === 'date' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'date' && styles.categoryFilterTextActive]}>Más recientes</Text></TouchableOpacity>{showOutfitScore && <TouchableOpacity onPress={() => setSortBy('score')} style={[styles.categoryFilter, sortBy === 'score' && styles.categoryFilterActive]}><Feather name="star" size={14} color={sortBy === 'score' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'score' && styles.categoryFilterTextActive]}>Mejor puntuación</Text></TouchableOpacity>}</View>{orderedOutfits.map((outfit) => <OutfitHistoryCard key={outfit.id} outfit={outfit} onOpen={() => setSelectedOutfit(outfit)} onDelete={() => deleteOutfit(outfit)} showOutfitScore={showOutfitScore} />)}</ScrollView>
-    <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><Image source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} /></TouchableOpacity>{selectedOutfit.styleGoal && <View style={{ alignSelf: 'flex-start', backgroundColor: '#F0F3EC', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 12 }}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>OBJETIVO: {selectedOutfit.styleGoal.toLocaleUpperCase('es')}</Text></View>}{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.fabricType} · {item.texture}</Text>{hasUsefulValue(item.materialEstimate) && <Text style={styles.cardMeta}>Composición aparente: {item.materialEstimate}</Text>}<Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
+    <FlatList data={orderedOutfits} keyExtractor={(outfit) => outfit.id} initialNumToRender={8} maxToRenderPerBatch={8} windowSize={5} removeClippedSubviews={Platform.OS !== 'web'} contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false} ListHeaderComponent={<><View style={{ height: 18 }} /><View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>HISTORIAL</Text><Text style={styles.title}>Tus outfits</Text><Text style={styles.addIntro}>{outfits.length} outfits analizados.</Text></View><View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}><TouchableOpacity onPress={() => setSortBy('date')} style={[styles.categoryFilter, sortBy === 'date' && styles.categoryFilterActive]}><Feather name="calendar" size={14} color={sortBy === 'date' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'date' && styles.categoryFilterTextActive]}>Más recientes</Text></TouchableOpacity>{showOutfitScore && <TouchableOpacity onPress={() => setSortBy('score')} style={[styles.categoryFilter, sortBy === 'score' && styles.categoryFilterActive]}><Feather name="star" size={14} color={sortBy === 'score' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'score' && styles.categoryFilterTextActive]}>Mejor puntuación</Text></TouchableOpacity>}</View></>} renderItem={({ item }) => <OutfitHistoryCard outfit={item} onOpen={() => setSelectedOutfit(item)} onDelete={() => deleteOutfit(item)} showOutfitScore={showOutfitScore} />} />
+    <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><CachedImage source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} contentFit="cover" cachePolicy="memory-disk" transition={120} /></TouchableOpacity>{selectedOutfit.styleGoal && <View style={{ alignSelf: 'flex-start', backgroundColor: '#F0F3EC', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 12 }}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>OBJETIVO: {selectedOutfit.styleGoal.toLocaleUpperCase('es')}</Text></View>}{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.fabricType} · {item.texture}</Text>{hasUsefulValue(item.materialEstimate) && <Text style={styles.cardMeta}>Composición aparente: {item.materialEstimate}</Text>}<Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
     <Modal visible={fullScreenImage !== null} transparent animationType="fade" onRequestClose={() => setFullScreenImage(null)}><View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}><TouchableOpacity onPress={() => setFullScreenImage(null)} style={{ position: 'absolute', top: 52, right: 20, zIndex: 2, width: 42, height: 42, borderRadius: 21, backgroundColor: 'rgba(255,255,255,0.9)', alignItems: 'center', justifyContent: 'center' }}><Feather name="x" size={22} color={COLORS.ink} /></TouchableOpacity>{fullScreenImage && <Image source={{ uri: fullScreenImage }} resizeMode="contain" style={{ width: '100%', height: '100%' }} />}</View></Modal>
     {recentlyDeleted && <View style={{ position: 'absolute', left: 20, right: 20, bottom: 22, minHeight: 54, borderRadius: 16, backgroundColor: COLORS.ink, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10, elevation: 6 }}><Text style={{ color: COLORS.white, fontSize: 12, fontWeight: '700' }}>Outfit eliminado</Text><TouchableOpacity onPress={undoDelete} style={{ paddingVertical: 10, paddingLeft: 16 }}><Text style={{ color: '#DDE7D6', fontSize: 12, fontWeight: '800' }}>Deshacer</Text></TouchableOpacity></View>}
   </>;
 }
 
 function HomeCategoryCard({ category, imageIndex, onPress }: { category: HomeCategory; imageIndex: number; onPress: () => void }) {
-  const [displayedIndex, setDisplayedIndex] = useState(imageIndex);
-  const opacity = useState(() => new Animated.Value(1))[0];
-
-  useEffect(() => {
-    let active = true;
-    if (imageIndex !== displayedIndex) {
-      Animated.timing(opacity, { toValue: 0.78, duration: 350, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }).start(() => {
-        if (!active) return;
-        setDisplayedIndex(imageIndex);
-        Animated.timing(opacity, { toValue: 1, duration: 850, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }).start();
-      });
-    }
-    return () => {
-      active = false;
-      opacity.stopAnimation();
-      opacity.setValue(1);
-    };
-  }, [imageIndex, opacity]);
-
   return <TouchableOpacity style={styles.categoryCard} activeOpacity={0.84} onPress={onPress}>
-    <View style={styles.categoryImageFrame}><Animated.Image source={{ uri: category.imageUris[displayedIndex] }} style={[styles.categoryImage, { opacity }]} />{category.imageUris.length > 1 && <View style={styles.carouselCount}><Feather name="layers" size={9} color={COLORS.white} /><Text style={styles.carouselCountText}>{category.imageUris.length}</Text></View>}</View>
+    <View style={styles.categoryImageFrame}><CachedImage source={{ uri: category.imageUris[imageIndex] }} style={styles.categoryImage} contentFit="cover" cachePolicy="memory-disk" transition={220} recyclingKey={`${category.key}-${imageIndex}`} />{category.imageUris.length > 1 && <View style={styles.carouselCount}><Feather name="layers" size={9} color={COLORS.white} /><Text style={styles.carouselCountText}>{category.imageUris.length}</Text></View>}</View>
     <Text style={styles.cardTitle}>{category.label}</Text><Text style={styles.cardMeta}>{category.count} {category.count === 1 ? 'prenda' : 'prendas'}</Text>
   </TouchableOpacity>;
 }
@@ -1571,7 +1801,7 @@ function Home({ items, displayName, onAdd, onCamera, onOpenWardrobe, onOpenProfi
       key: category.key,
       label: category.label,
       count: (groups[category.key]?.count || 0) + 1,
-      imageUris: [...(groups[category.key]?.imageUris || []), item.imageUri],
+      imageUris: [...(groups[category.key]?.imageUris || []), item.thumbnailUri || item.imageUri],
     };
     return groups;
   }, {})).sort((first, second) => second.count - first.count);
@@ -1629,13 +1859,30 @@ function Home({ items, displayName, onAdd, onCamera, onOpenWardrobe, onOpenProfi
 }
 
 export default function App() {
+  const [startupLoading, setStartupLoading] = useState(true);
   useEffect(() => {
-    const apiUrl = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3001';
-    void fetch(`${apiUrl}/health`).then((response) => {
-      if (!response.ok) console.warn(`[Backend] El precalentamiento ha respondido con HTTP ${response.status}.`);
-    }).catch((error: unknown) => {
-      console.warn('[Backend] No se ha podido precalentar el servidor:', error);
+    let active = true;
+    let minimumElapsed = false;
+    let warmupFinished = false;
+    const revealWhenReady = () => {
+      if (active && minimumElapsed && warmupFinished) setStartupLoading(false);
+    };
+    const minimumTimer = setTimeout(() => {
+      minimumElapsed = true;
+      revealWhenReady();
+    }, STARTUP_LOADING_MIN_MS);
+    const maximumTimer = setTimeout(() => {
+      if (active) setStartupLoading(false);
+    }, STARTUP_LOADING_MAX_MS);
+    void backendWarmupPromise.then(() => {
+      warmupFinished = true;
+      revealWhenReady();
     });
+    return () => {
+      active = false;
+      clearTimeout(minimumTimer);
+      clearTimeout(maximumTimer);
+    };
   }, []);
 
   const [tab, setTab] = useState<Tab>('inicio');
@@ -1744,7 +1991,9 @@ export default function App() {
       }
       const garments = await Promise.all((garmentRows as DatabaseGarmentRow[]).map(async (row) => {
         try {
-          return rowToSavedGarment(row, await signedGarmentUrl(row.image_path));
+          const imageUri = await signedGarmentUrl(row.image_path);
+          const thumbnailUri = row.thumbnail_path ? await signedGarmentUrl(row.thumbnail_path) : imageUri;
+          return rowToSavedGarment(row, imageUri, thumbnailUri);
         } catch (error) {
           console.warn('[Supabase] No se pudo firmar una foto del armario:', error);
           return null;
@@ -1760,10 +2009,13 @@ export default function App() {
       }
       const outfits: Array<SavedOutfit | null> = await Promise.all((outfitRows as DatabaseOutfitRow[]).map(async (row): Promise<SavedOutfit | null> => {
         try {
+          const imageUri = await signedOutfitUrl(row.image_path);
           return {
             id: row.id,
-            imageUri: await signedOutfitUrl(row.image_path),
+            imageUri,
+            thumbnailUri: row.thumbnail_path ? await signedOutfitUrl(row.thumbnail_path) : imageUri,
             storagePath: row.image_path,
+            thumbnailStoragePath: row.thumbnail_path || undefined,
             garments: (linksByOutfit.get(row.id) || []).map((id) => garmentsById.get(id)).filter((item): item is SavedGarment => Boolean(item)),
             evaluation: row.evaluation as OutfitEvaluation | null,
             styleGoal: row.style_goal || '',
@@ -1788,17 +2040,19 @@ export default function App() {
 
   const persistGarment = async (item: SavedGarment) => {
     if (!session?.user.id) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
-    const storagePath = await uploadGarmentImage(session.user.id, item.imageUri);
-    const { data, error } = await supabase.from('garments').insert({ user_id: session.user.id, ...garmentPayload(item, storagePath) }).select().single();
+    const { imagePath, thumbnailPath } = await uploadGarmentImage(session.user.id, item.imageUri);
+    const { data, error } = await supabase.from('garments').insert({ user_id: session.user.id, ...garmentPayload(item, imagePath, thumbnailPath) }).select().single();
     if (error || !data) {
-      await supabase.storage.from(GARMENT_BUCKET).remove([storagePath]);
+      await supabase.storage.from(GARMENT_BUCKET).remove([imagePath, thumbnailPath]);
       throw new Error(error?.message || 'No hemos podido guardar la prenda.');
     }
-    return rowToSavedGarment(data as DatabaseGarmentRow, await signedGarmentUrl(storagePath));
+    const [imageUri, thumbnailUri] = await Promise.all([signedGarmentUrl(imagePath), signedGarmentUrl(thumbnailPath)]);
+    return rowToSavedGarment(data as DatabaseGarmentRow, imageUri, thumbnailUri);
   };
 
   const saveToWardrobe = async (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[], outfit: OutfitDraft, appearanceItems: SavedGarment[], matchedGarmentIds: Record<string, string>) => {
     let outfitStoragePath: string | null = null;
+    let outfitThumbnailStoragePath: string | null = null;
     let persistedOutfitId: string | null = null;
     try {
       if (!session?.user.id) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
@@ -1809,10 +2063,17 @@ export default function App() {
         const wearCount = (updated.wearCount || item.wearCount || 1) + (wornItemIds.includes(item.id) ? 1 : 0);
         if (!updatesById.has(item.id) && !wornItemIds.includes(item.id)) return item;
         let storagePath = updated.storagePath || item.storagePath;
-        if (isLocalImage(updated.imageUri)) storagePath = await uploadGarmentImage(session!.user.id, updated.imageUri, storagePath);
-        const { data, error } = await supabase.from('garments').update(garmentPayload({ ...updated, wearCount }, storagePath || '')).eq('id', item.id).select().single();
+        let thumbnailStoragePath = updated.thumbnailStoragePath || item.thumbnailStoragePath;
+        if (isLocalImage(updated.imageUri)) {
+          const uploaded = await uploadGarmentImage(session!.user.id, updated.imageUri, storagePath, thumbnailStoragePath);
+          storagePath = uploaded.imagePath;
+          thumbnailStoragePath = uploaded.thumbnailPath;
+        }
+        const { data, error } = await supabase.from('garments').update(garmentPayload({ ...updated, wearCount }, storagePath || '', thumbnailStoragePath || null)).eq('id', item.id).select().single();
         if (error || !data) throw new Error(error?.message || 'No hemos podido actualizar una prenda.');
-        return rowToSavedGarment(data as DatabaseGarmentRow, storagePath ? await signedGarmentUrl(storagePath) : item.imageUri);
+        const imageUri = storagePath ? await signedGarmentUrl(storagePath) : item.imageUri;
+        const thumbnailUri = thumbnailStoragePath ? await signedGarmentUrl(thumbnailStoragePath) : imageUri;
+        return rowToSavedGarment(data as DatabaseGarmentRow, imageUri, thumbnailUri);
       }));
       const nextGarments = [...persistedItems, ...nextExistingItems];
       const persistedByTemporaryId = new Map(items.map((item, index) => [item.id, persistedItems[index]]));
@@ -1823,11 +2084,14 @@ export default function App() {
       }
       if (linkedGarmentIds.size === 0) throw new Error('No hemos podido asociar las prendas al outfit.');
 
-      outfitStoragePath = await uploadOutfitImage(session.user.id, outfit.imageUri);
-      const uploadedOutfitPath = outfitStoragePath;
+      const uploadedOutfit = await uploadOutfitImage(session.user.id, outfit.imageUri);
+      outfitStoragePath = uploadedOutfit.imagePath;
+      outfitThumbnailStoragePath = uploadedOutfit.thumbnailPath;
+      const uploadedOutfitPath = uploadedOutfit.imagePath;
       const { data: outfitRow, error: outfitError } = await supabase.from('outfits').insert({
         user_id: session.user.id,
         image_path: uploadedOutfitPath,
+        thumbnail_path: uploadedOutfit.thumbnailPath,
         evaluation: outfit.evaluation,
         style_goal: outfit.styleGoal,
         taken_at: outfit.createdAt,
@@ -1854,7 +2118,9 @@ export default function App() {
       const createdOutfit: SavedOutfit = {
         id: savedOutfitId,
         imageUri: await signedOutfitUrl(uploadedOutfitPath),
+        thumbnailUri: await signedOutfitUrl(uploadedOutfit.thumbnailPath),
         storagePath: uploadedOutfitPath,
+        thumbnailStoragePath: uploadedOutfit.thumbnailPath,
         garments: outfitLinks.map((link) => nextGarments.find((item) => item.id === link.garment_id)).filter((item): item is SavedGarment => Boolean(item)),
         evaluation: outfit.evaluation,
         styleGoal: outfit.styleGoal,
@@ -1874,7 +2140,8 @@ export default function App() {
       setNotice({ title: 'Armario guardado', message: messages.join('\n') });
     } catch (error) {
       if (persistedOutfitId) await supabase.from('outfits').delete().eq('id', persistedOutfitId);
-      if (outfitStoragePath) await supabase.storage.from(OUTFIT_BUCKET).remove([outfitStoragePath]);
+      const uploadedOutfitPaths = [outfitStoragePath, outfitThumbnailStoragePath].filter((path): path is string => Boolean(path));
+      if (uploadedOutfitPaths.length > 0) await supabase.storage.from(OUTFIT_BUCKET).remove(uploadedOutfitPaths);
       console.error('[Supabase] Error guardando el armario:', error);
       setNotice({ title: 'No hemos podido guardar el armario', message: error instanceof Error ? error.message : 'Comprueba tu conexión e inténtalo de nuevo.' });
       throw error;
@@ -1885,8 +2152,9 @@ export default function App() {
     try {
       const { error } = await supabase.from('garments').delete().eq('id', id);
       if (error) throw error;
-      if (item?.storagePath) {
-        const { error: storageError } = await supabase.storage.from(GARMENT_BUCKET).remove([item.storagePath]);
+      const storedPaths = [item?.storagePath, item?.thumbnailStoragePath].filter((path): path is string => Boolean(path));
+      if (storedPaths.length > 0) {
+        const { error: storageError } = await supabase.storage.from(GARMENT_BUCKET).remove(storedPaths);
         if (storageError) console.warn('[Supabase] La ficha se eliminó, pero no la imagen:', storageError.message);
       }
       setSavedGarments((current) => current.filter((garment) => garment.id !== id));
@@ -1901,12 +2169,15 @@ export default function App() {
     if (!keptItem || !mergedItem) return;
     try {
       const mergedWearCount = (keptItem.wearCount || 1) + (mergedItem.wearCount || 1);
-      const { data, error } = await supabase.from('garments').update(garmentPayload({ ...keptItem, wearCount: mergedWearCount }, keptItem.storagePath || '')).eq('id', keptId).select().single();
+      const { data, error } = await supabase.from('garments').update(garmentPayload({ ...keptItem, wearCount: mergedWearCount }, keptItem.storagePath || '', keptItem.thumbnailStoragePath || null)).eq('id', keptId).select().single();
       if (error || !data) throw new Error(error?.message || 'No hemos podido fusionar las prendas.');
       const { error: deleteError } = await supabase.from('garments').delete().eq('id', mergedId);
       if (deleteError) throw deleteError;
-      if (mergedItem.storagePath) await supabase.storage.from(GARMENT_BUCKET).remove([mergedItem.storagePath]);
-      const persistedKept = rowToSavedGarment(data as DatabaseGarmentRow, keptItem.storagePath ? await signedGarmentUrl(keptItem.storagePath) : keptItem.imageUri);
+      const mergedPaths = [mergedItem.storagePath, mergedItem.thumbnailStoragePath].filter((path): path is string => Boolean(path));
+      if (mergedPaths.length > 0) await supabase.storage.from(GARMENT_BUCKET).remove(mergedPaths);
+      const keptImageUri = keptItem.storagePath ? await signedGarmentUrl(keptItem.storagePath) : keptItem.imageUri;
+      const keptThumbnailUri = keptItem.thumbnailStoragePath ? await signedGarmentUrl(keptItem.thumbnailStoragePath) : keptImageUri;
+      const persistedKept = rowToSavedGarment(data as DatabaseGarmentRow, keptImageUri, keptThumbnailUri);
       setSavedGarments((current) => current.filter((item) => item.id !== mergedId).map((item) => item.id === keptId ? persistedKept : item));
       setNotice({ title: 'Prendas fusionadas', message: 'Hemos combinado sus usos y eliminado la foto duplicada.' });
     } catch (error) {
@@ -1916,14 +2187,19 @@ export default function App() {
   const updateWardrobeItem = async (updatedItem: SavedGarment) => {
     try {
       let storagePath = updatedItem.storagePath;
+      let thumbnailStoragePath = updatedItem.thumbnailStoragePath;
       if (isLocalImage(updatedItem.imageUri)) {
         if (!session?.user.id) throw new Error('Tu sesión ha caducado.');
-        storagePath = await uploadGarmentImage(session.user.id, updatedItem.imageUri, storagePath);
+        const uploaded = await uploadGarmentImage(session.user.id, updatedItem.imageUri, storagePath, thumbnailStoragePath);
+        storagePath = uploaded.imagePath;
+        thumbnailStoragePath = uploaded.thumbnailPath;
       }
       if (!storagePath) throw new Error('No se ha encontrado la foto de esta prenda.');
-      const { data, error } = await supabase.from('garments').update(garmentPayload(updatedItem, storagePath)).eq('id', updatedItem.id).select().single();
+      const { data, error } = await supabase.from('garments').update(garmentPayload(updatedItem, storagePath, thumbnailStoragePath || null)).eq('id', updatedItem.id).select().single();
       if (error || !data) throw new Error(error?.message || 'No hemos podido guardar los cambios.');
-      const persistedItem = rowToSavedGarment(data as DatabaseGarmentRow, await signedGarmentUrl(storagePath));
+      const imageUri = await signedGarmentUrl(storagePath);
+      const thumbnailUri = thumbnailStoragePath ? await signedGarmentUrl(thumbnailStoragePath) : imageUri;
+      const persistedItem = rowToSavedGarment(data as DatabaseGarmentRow, imageUri, thumbnailUri);
       setSavedGarments((current) => current.map((item) => item.id === persistedItem.id ? persistedItem : item));
       setNotice({ title: 'Cambios guardados', message: 'La ficha de la prenda se ha actualizado.' });
     } catch (error) {
@@ -1936,8 +2212,9 @@ export default function App() {
     try {
       const { error } = await supabase.from('outfits').delete().eq('id', outfit.id);
       if (error) throw error;
-      if (outfit.storagePath) {
-        const { error: storageError } = await supabase.storage.from(OUTFIT_BUCKET).remove([outfit.storagePath]);
+      const storedPaths = [outfit.storagePath, outfit.thumbnailStoragePath].filter((path): path is string => Boolean(path));
+      if (storedPaths.length > 0) {
+        const { error: storageError } = await supabase.storage.from(OUTFIT_BUCKET).remove(storedPaths);
         if (storageError) console.warn('[Supabase] El outfit se eliminó, pero no su foto:', storageError.message);
       }
     } catch (error) {
@@ -1954,6 +2231,7 @@ export default function App() {
     setTab('inicio');
     setOnboardingCompleted(false);
   };
+  if (startupLoading) return <StartupLoading />;
   if (authLoading || (session && wardrobeLoading)) return <SafeAreaView style={styles.safe}><StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} /><View style={styles.authLoading}><ActivityIndicator color={COLORS.sageDark} /><Text style={styles.authLoadingText}>Conectando con tu armario…</Text></View></SafeAreaView>;
   if (!session) return <LoginScreen />;
   if (!onboardingCompleted) return <OnboardingScreen initialName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || ''} initialGender={session.user.user_metadata?.gender_identity} initialStyles={session.user.user_metadata?.style_preferences} initialColors={session.user.user_metadata?.color_preferences} initialShops={session.user.user_metadata?.favorite_shops} initialShowOutfitScore={session.user.user_metadata?.show_outfit_score !== false} initialShowImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} onComplete={() => setOnboardingCompleted(true)} />;
@@ -2002,16 +2280,16 @@ const styles = StyleSheet.create({
   loadingScreen: { flex: 1, overflow: 'hidden', backgroundColor: COLORS.paper }, preparationScreen: { flex: 1, overflow: 'hidden', backgroundColor: '#F3F5F0' }, loadingContent: { flex: 1, zIndex: 2, paddingHorizontal: 34, alignItems: 'center', justifyContent: 'center' }, loadingEyebrow: { color: COLORS.sageDark, fontSize: 10, fontWeight: '800', letterSpacing: 1.7, marginBottom: 22 }, loadingIcon: { width: 76, height: 76, borderRadius: 38, backgroundColor: COLORS.clay, alignItems: 'center', justifyContent: 'center', marginBottom: 26, shadowColor: COLORS.clay, shadowOpacity: 0.28, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 }, preparationIcon: { width: 76, height: 76, borderRadius: 24, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', marginBottom: 26, shadowColor: COLORS.sageDark, shadowOpacity: 0.24, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 }, loadingTitle: { color: COLORS.ink, fontSize: 25, lineHeight: 32, fontWeight: '700', textAlign: 'center', minHeight: 64, maxWidth: 310 }, loadingText: { color: COLORS.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', maxWidth: 300, marginTop: 10 }, loadingSpinner: { marginTop: 28 }, loadingDecorationTop: { position: 'absolute', width: 260, height: 260, borderRadius: 130, backgroundColor: '#E6ECE1', top: -110, right: -85 }, loadingDecorationBottom: { position: 'absolute', width: 220, height: 220, borderRadius: 110, backgroundColor: '#F0D9CF', bottom: -105, left: -80 },
   addScroll: { padding: 20, paddingBottom: 40 }, addHeader: { marginTop: 10, marginBottom: 24 }, addIntro: { color: COLORS.muted, fontSize: 14, lineHeight: 21, marginTop: 10, maxWidth: 340 },
   stepScroll: { padding: 20, paddingBottom: 44 }, backButton: { alignSelf: 'flex-start', height: 40, flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 3, marginBottom: 16 }, backButtonText: { color: COLORS.ink, fontSize: 13, fontWeight: '700' }, stepImage: { width: '100%', height: 230, borderRadius: 22, backgroundColor: COLORS.sand, marginBottom: 2 }, reviewHero: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.white, borderRadius: 20, padding: 10, marginBottom: 6 }, reviewImage: { width: 88, height: 112, borderRadius: 14, backgroundColor: COLORS.sand }, reviewHeroCopy: { flex: 1, paddingHorizontal: 15 }, reviewHeroTitle: { color: COLORS.ink, fontSize: 20, fontWeight: '700', marginBottom: 5 }, reviewHeroText: { color: COLORS.muted, fontSize: 11, lineHeight: 16 },
-  duplicateScroll: { padding: 20, paddingBottom: 42 }, duplicateTitle: { color: COLORS.ink, fontSize: 27, lineHeight: 34, fontWeight: '700', marginTop: 7 }, duplicateIntro: { color: COLORS.muted, fontSize: 13, lineHeight: 20, marginTop: 9, maxWidth: 345 }, duplicateCounter: { alignSelf: 'flex-start', backgroundColor: '#E8EEE3', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginTop: 16, marginBottom: 13 }, duplicateCounterText: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800' }, comparisonRow: { flexDirection: 'row', alignItems: 'center' }, comparisonColumn: { flex: 1, alignSelf: 'flex-start' }, comparisonLabel: { color: COLORS.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 7 }, comparisonImage: { width: '100%', height: 230, borderRadius: 17, backgroundColor: COLORS.sand }, bestPhotoBadge: { position: 'absolute', left: 7, bottom: 7, height: 23, borderRadius: 12, backgroundColor: COLORS.sageDark, paddingHorizontal: 8, flexDirection: 'row', alignItems: 'center', gap: 4 }, bestPhotoBadgeText: { color: COLORS.white, fontSize: 8, fontWeight: '800' }, comparisonName: { color: COLORS.ink, fontSize: 12, lineHeight: 17, fontWeight: '700', marginTop: 9 }, comparisonUses: { color: COLORS.clay, fontSize: 9, fontWeight: '800', marginTop: 4 }, comparisonDivider: { width: 38, alignItems: 'center' }, comparisonVs: { color: COLORS.muted, fontSize: 9, fontWeight: '900' }, duplicateClues: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#E8EEE3', borderRadius: 15, padding: 13, marginTop: 18, marginBottom: 14 }, duplicateCluesText: { flex: 1, color: COLORS.sageDark, fontSize: 10, lineHeight: 15 }, sameGarmentButton: { minHeight: 58, borderRadius: 17, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 16 }, sameGarmentButtonTitle: { color: COLORS.white, fontSize: 13, fontWeight: '800' }, sameGarmentButtonText: { color: '#DDE5D8', fontSize: 9, marginTop: 3 }, differentGarmentButton: { minHeight: 58, borderRadius: 17, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 16, marginTop: 10 }, differentGarmentButtonTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '800' }, differentGarmentButtonText: { color: COLORS.muted, fontSize: 9, marginTop: 3 },
+  duplicateScroll: { padding: 20, paddingBottom: 42 }, duplicateTitle: { color: COLORS.ink, fontSize: 27, lineHeight: 34, fontWeight: '700', marginTop: 7 }, duplicateIntro: { color: COLORS.muted, fontSize: 13, lineHeight: 20, marginTop: 9, maxWidth: 345 }, duplicateCounter: { alignSelf: 'flex-start', backgroundColor: '#E8EEE3', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginTop: 16, marginBottom: 13 }, duplicateCounterText: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800' }, comparisonRow: { flexDirection: 'row', alignItems: 'center' }, comparisonColumn: { flex: 1, alignSelf: 'flex-start' }, comparisonLabel: { color: COLORS.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 7 }, comparisonImage: { width: '100%', height: 230, borderRadius: 17, backgroundColor: COLORS.sand }, bestPhotoBadge: { position: 'absolute', left: 7, bottom: 7, height: 23, borderRadius: 12, backgroundColor: COLORS.sageDark, paddingHorizontal: 8, flexDirection: 'row', alignItems: 'center', gap: 4 }, bestPhotoBadgeText: { color: COLORS.white, fontSize: 8, fontWeight: '800' }, comparisonName: { color: COLORS.ink, fontSize: 12, lineHeight: 17, fontWeight: '700', marginTop: 9 }, comparisonUses: { color: COLORS.clay, fontSize: 9, fontWeight: '800', marginTop: 4 }, comparisonDivider: { width: 38, alignItems: 'center' }, comparisonVs: { color: COLORS.muted, fontSize: 9, fontWeight: '900' }, duplicateClues: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#E8EEE3', borderRadius: 15, padding: 13, marginTop: 18, marginBottom: 10 }, duplicateCluesText: { flex: 1, color: COLORS.sageDark, fontSize: 10, lineHeight: 15 }, duplicateReason: { backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, padding: 13, marginBottom: 14 }, duplicateReasonTitle: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800', letterSpacing: 0.7, marginBottom: 5 }, duplicateReasonText: { color: COLORS.muted, fontSize: 11, lineHeight: 16 }, sameGarmentButton: { minHeight: 58, borderRadius: 17, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 16 }, sameGarmentButtonTitle: { color: COLORS.white, fontSize: 13, fontWeight: '800' }, sameGarmentButtonText: { color: '#DDE5D8', fontSize: 9, marginTop: 3 }, differentGarmentButton: { minHeight: 58, borderRadius: 17, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 16, marginTop: 10 }, differentGarmentButtonTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '800' }, differentGarmentButtonText: { color: COLORS.muted, fontSize: 9, marginTop: 3 },
   galleryPicker: { minHeight: 330, borderWidth: 1.5, borderStyle: 'dashed', borderColor: '#BFC8B8', borderRadius: 26, backgroundColor: '#F0F3EC', alignItems: 'center', justifyContent: 'center', padding: 24 }, galleryIcon: { width: 68, height: 68, borderRadius: 34, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginBottom: 18 }, galleryTitle: { color: COLORS.ink, fontSize: 20, fontWeight: '700', marginBottom: 7 }, galleryText: { color: COLORS.muted, fontSize: 12, marginBottom: 24 }, galleryAction: { backgroundColor: COLORS.clay, borderRadius: 15, paddingHorizontal: 19, paddingVertical: 13, flexDirection: 'row', gap: 9, alignItems: 'center' }, galleryActionText: { color: COLORS.white, fontSize: 14, fontWeight: '700' },
   previewFrame: { height: 430, borderRadius: 26, overflow: 'hidden', backgroundColor: COLORS.sand }, previewImage: { width: '100%', height: '100%' }, removeImage: { position: 'absolute', top: 14, right: 14, width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(255,255,255,0.92)', alignItems: 'center', justifyContent: 'center' }, imageReady: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#E8EEE3', borderRadius: 17, padding: 14, marginTop: 14 }, readyIcon: { width: 32, height: 32, borderRadius: 16, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginRight: 11 }, readyCopy: { flex: 1 }, readyTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' }, readyText: { color: COLORS.muted, fontSize: 11, marginTop: 3 }, secondaryButton: { height: 50, marginTop: 12, borderRadius: 15, borderWidth: 1, borderColor: '#CCD3C5', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8 }, secondaryButtonText: { color: COLORS.sageDark, fontWeight: '700', fontSize: 13 }, privacyNote: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 7, marginTop: 20, paddingHorizontal: 20 }, privacyText: { color: COLORS.muted, fontSize: 10, textAlign: 'center' },
   analyzeButton: { height: 54, marginTop: 12, borderRadius: 16, backgroundColor: COLORS.clay, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 9 }, analyzeButtonText: { color: COLORS.white, fontWeight: '700', fontSize: 14 }, buttonDisabled: { opacity: 0.65 },
   analysisNote: { color: COLORS.muted, fontSize: 10, textAlign: 'center', marginTop: 9 }, peoplePicker: { backgroundColor: COLORS.white, borderRadius: 20, padding: 16, marginTop: 16 }, peoplePickerIcon: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#E8EEE3', alignItems: 'center', justifyContent: 'center', marginBottom: 12 }, peoplePickerTitle: { color: COLORS.ink, fontSize: 19, fontWeight: '700', marginBottom: 5 }, peoplePickerText: { color: COLORS.muted, fontSize: 12, lineHeight: 18, marginBottom: 13 }, personOption: { minHeight: 72, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 10, marginTop: 8, flexDirection: 'row', alignItems: 'center' }, personOptionSelected: { borderColor: COLORS.sageDark, backgroundColor: '#F1F4EE' }, personAvatar: { width: 52, height: 52, borderRadius: 26, overflow: 'hidden', backgroundColor: COLORS.sand, alignItems: 'center', justifyContent: 'center', marginRight: 11 }, personAvatarSelected: { backgroundColor: COLORS.sageDark }, faceThumbnail: { width: '100%', height: '100%' }, personAvatarText: { color: COLORS.ink, fontSize: 12, fontWeight: '800' }, personAvatarTextSelected: { color: COLORS.white }, personCopy: { flex: 1 }, personTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' }, personMeta: { color: COLORS.muted, fontSize: 10, marginTop: 3, textTransform: 'capitalize' },
   results: { marginTop: 24 }, resultsHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }, resultsTitle: { color: COLORS.ink, fontSize: 19, fontWeight: '700' }, betaBadge: { backgroundColor: '#E7ECE2', borderRadius: 7, paddingHorizontal: 8, paddingVertical: 4 }, betaText: { color: COLORS.sageDark, fontSize: 8, fontWeight: '800', letterSpacing: 1 }, resultCard: { backgroundColor: COLORS.white, borderRadius: 16, padding: 13, marginBottom: 9, flexDirection: 'row', alignItems: 'center' }, resultNumber: { width: 32, height: 32, borderRadius: 16, backgroundColor: COLORS.sand, alignItems: 'center', justifyContent: 'center', marginRight: 11 }, resultNumberText: { color: COLORS.ink, fontSize: 12, fontWeight: '700' }, resultContent: { flex: 1 }, resultName: { color: COLORS.ink, fontSize: 14, fontWeight: '700', textTransform: 'capitalize' }, resultMeta: { color: COLORS.muted, fontSize: 11, marginTop: 4, textTransform: 'capitalize' }, confidence: { color: COLORS.sageDark, fontSize: 11, fontWeight: '700', marginLeft: 8 },
-  reviewHint: { color: COLORS.muted, fontSize: 12, lineHeight: 18, marginBottom: 13 }, editCard: { backgroundColor: COLORS.white, borderRadius: 19, padding: 15, marginBottom: 12 }, editCardHead: { flexDirection: 'row', alignItems: 'center', marginBottom: 15 }, editCardHeadCollapsed: { marginBottom: 0 }, editCardTitle: { color: COLORS.ink, fontWeight: '700', fontSize: 15, flex: 1 }, confidenceBadge: { backgroundColor: '#EDF1E9', borderRadius: 9, paddingHorizontal: 8, paddingVertical: 5 }, fieldRow: { flexDirection: 'row', gap: 10 }, fieldHalf: { flex: 1 }, fieldLabel: { color: COLORS.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 5 }, fieldInput: { minHeight: 42, borderRadius: 11, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', color: COLORS.ink, fontSize: 13, paddingHorizontal: 11, marginBottom: 11 }, saveButton: { height: 56, borderRadius: 17, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, marginTop: 3 }, saveButtonText: { color: COLORS.white, fontWeight: '700', fontSize: 14 },
+  reviewHint: { color: COLORS.muted, fontSize: 12, lineHeight: 18, marginBottom: 13 }, editCard: { backgroundColor: COLORS.white, borderRadius: 19, padding: 15, marginBottom: 12 }, editCardHead: { flexDirection: 'row', alignItems: 'center', marginBottom: 15 }, editCardHeadCollapsed: { marginBottom: 0 }, editCardTitle: { color: COLORS.ink, fontWeight: '700', fontSize: 15, flex: 1 }, confidenceBadge: { backgroundColor: '#EDF1E9', borderRadius: 9, paddingHorizontal: 8, paddingVertical: 5 }, fieldRow: { flexDirection: 'row', gap: 10 }, fieldHalf: { flex: 1 }, fieldLabel: { color: COLORS.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 5 }, fieldInput: { minHeight: 42, borderRadius: 11, borderWidth: 1, borderColor: COLORS.line, backgroundColor: '#FBFAF8', color: COLORS.ink, fontSize: 13, paddingHorizontal: 11, marginBottom: 11 }, saveButton: { height: 56, borderRadius: 17, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, marginTop: 3 }, saveButtonText: { color: COLORS.white, fontWeight: '700', fontSize: 14 }, backgroundCheck: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 11 }, backgroundCheckText: { color: COLORS.muted, fontSize: 10 },
   editCardExcluded: { opacity: 0.62, backgroundColor: '#EEEAE5' }, includeControl: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 9, backgroundColor: '#E8EEE3', paddingHorizontal: 9, paddingVertical: 7 }, includeControlExcluded: { backgroundColor: '#E4E0DB' }, includeControlText: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800' }, includeControlTextExcluded: { color: COLORS.muted }, excludedNotice: { color: COLORS.muted, fontSize: 10, lineHeight: 15, marginTop: -6, marginBottom: 12 },
   materialSection: { borderTopWidth: 1, borderTopColor: COLORS.line, paddingTop: 12, marginTop: 2 }, materialHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 11 }, materialTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' }, materialConfidence: { color: COLORS.sageDark, fontSize: 9, fontWeight: '700' },
-  wardrobeScroll: { padding: 20, paddingBottom: 40 }, wardrobeHeader: { marginTop: 10, marginBottom: 18 }, categoryFilters: { gap: 8, paddingRight: 14, marginBottom: 16 }, categoryFilter: { height: 38, borderRadius: 19, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.white, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 7 }, categoryFilterActive: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark }, categoryFilterText: { color: COLORS.ink, fontSize: 11, fontWeight: '700', textTransform: 'capitalize' }, categoryFilterTextActive: { color: COLORS.white }, categoryFilterCount: { color: COLORS.muted, fontSize: 9, fontWeight: '800' }, filterSummary: { minHeight: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }, filteredCount: { color: COLORS.muted, fontSize: 10, fontWeight: '700' }, filterButton: { height: 36, borderRadius: 18, borderWidth: 1, borderColor: '#BFC8B8', paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 7, backgroundColor: COLORS.white }, filterButtonActive: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark }, filterButtonText: { color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }, filterButtonTextActive: { color: COLORS.white }, wardrobeGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 14 }, wardrobeItem: { width: '48%', borderRadius: 18, overflow: 'hidden', backgroundColor: COLORS.white }, wardrobeImage: { width: '100%', height: 190, backgroundColor: COLORS.sand }, wardrobeInfo: { padding: 12 }, wardrobeName: { color: COLORS.ink, fontSize: 14, fontWeight: '700' }, wardrobeMeta: { color: COLORS.muted, fontSize: 10, marginTop: 5, textTransform: 'capitalize' }, wardrobeMaterial: { color: COLORS.sageDark, fontSize: 9, marginTop: 5, textTransform: 'capitalize' }, wardrobeCardFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' }, stylePill: { alignSelf: 'flex-start', backgroundColor: '#E8EEE3', borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4, marginTop: 9 }, stylePillText: { color: COLORS.sageDark, fontSize: 9, fontWeight: '700', textTransform: 'capitalize' }, wearBadge: { minWidth: 28, height: 22, borderRadius: 11, backgroundColor: '#F2E2DA', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6, marginTop: 9 }, wearBadgeText: { color: COLORS.clay, fontSize: 9, fontWeight: '800' },
+  wardrobeScroll: { padding: 20, paddingBottom: 40 }, wardrobeHeader: { marginTop: 10, marginBottom: 18 }, categoryFilters: { gap: 8, paddingRight: 14, marginBottom: 16 }, categoryFilter: { height: 38, borderRadius: 19, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.white, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 7 }, categoryFilterActive: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark }, categoryFilterText: { color: COLORS.ink, fontSize: 11, fontWeight: '700', textTransform: 'capitalize' }, categoryFilterTextActive: { color: COLORS.white }, categoryFilterCount: { color: COLORS.muted, fontSize: 9, fontWeight: '800' }, filterSummary: { minHeight: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }, filteredCount: { color: COLORS.muted, fontSize: 10, fontWeight: '700' }, filterButton: { height: 36, borderRadius: 18, borderWidth: 1, borderColor: '#BFC8B8', paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 7, backgroundColor: COLORS.white }, filterButtonActive: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark }, filterButtonText: { color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }, filterButtonTextActive: { color: COLORS.white }, wardrobeGridRow: { justifyContent: 'space-between' }, wardrobeItem: { width: '48%', borderRadius: 18, overflow: 'hidden', backgroundColor: COLORS.white, marginBottom: 14 }, wardrobeImage: { width: '100%', height: 190, backgroundColor: COLORS.sand }, wardrobeInfo: { padding: 12 }, wardrobeName: { color: COLORS.ink, fontSize: 14, fontWeight: '700' }, wardrobeMeta: { color: COLORS.muted, fontSize: 10, marginTop: 5, textTransform: 'capitalize' }, wardrobeMaterial: { color: COLORS.sageDark, fontSize: 9, marginTop: 5, textTransform: 'capitalize' }, wardrobeCardFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' }, stylePill: { alignSelf: 'flex-start', backgroundColor: '#E8EEE3', borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4, marginTop: 9 }, stylePillText: { color: COLORS.sageDark, fontSize: 9, fontWeight: '700', textTransform: 'capitalize' }, wearBadge: { minWidth: 28, height: 22, borderRadius: 11, backgroundColor: '#F2E2DA', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6, marginTop: 9 }, wearBadgeText: { color: COLORS.clay, fontSize: 9, fontWeight: '800' },
   filterModalBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(32,29,26,0.38)' }, filterModalDismiss: { flex: 1 }, filterModal: { maxHeight: '78%', backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 20, paddingTop: 20, paddingBottom: 24 }, filterModalHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }, filterModalTitle: { color: COLORS.ink, fontSize: 21, fontWeight: '700' }, filterModalSubtitle: { color: COLORS.muted, fontSize: 11, marginTop: 4 }, filterClose: { width: 38, height: 38, borderRadius: 19, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center' }, filterGroupTitle: { color: COLORS.muted, fontSize: 9, fontWeight: '800', letterSpacing: 1, marginBottom: 9, marginTop: 4 }, filterOptions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 }, filterOption: { minHeight: 36, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.white, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 6 }, filterOptionActive: { borderColor: COLORS.sageDark, backgroundColor: COLORS.sageDark }, filterOptionText: { color: COLORS.ink, fontSize: 11, fontWeight: '700', textTransform: 'capitalize' }, filterOptionTextActive: { color: COLORS.white }, filterActions: { flexDirection: 'row', gap: 10, paddingTop: 14, borderTopWidth: 1, borderTopColor: COLORS.line }, clearFilterButton: { height: 50, paddingHorizontal: 19, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' }, clearFilterText: { color: COLORS.muted, fontSize: 12, fontWeight: '800' }, applyFilterButton: { height: 50, borderRadius: 15, backgroundColor: COLORS.clay, flex: 1, alignItems: 'center', justifyContent: 'center' }, applyFilterText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
   detailBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(32,29,26,0.42)' }, garmentDetail: { backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: 28 }, garmentDetailTitle: { color: COLORS.ink, fontSize: 21, fontWeight: '700', marginTop: 5, maxWidth: 280 }, garmentDetailImage: { width: '100%', height: 300, borderRadius: 20, backgroundColor: COLORS.sand }, wearSummary: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#E8EEE3', borderRadius: 17, padding: 15, marginTop: 15 }, wearSummaryIcon: { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginRight: 12 }, wearSummaryCount: { color: COLORS.ink, fontSize: 16, fontWeight: '800' }, wearSummaryText: { color: COLORS.muted, fontSize: 11, marginTop: 3 }, garmentDetailMeta: { color: COLORS.muted, fontSize: 11, lineHeight: 17, marginTop: 14, textTransform: 'capitalize' }, detailActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 18 }, editGarmentButton: { width: '100%', height: 48, borderRadius: 14, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }, editGarmentButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' }, rotateImageButton: { height: 48, borderRadius: 14, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }, mergeButton: { flex: 1, height: 48, borderRadius: 14, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }, mergeButtonText: { color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }, deleteButton: { height: 48, borderRadius: 14, borderWidth: 1, borderColor: '#DFC4BF', backgroundColor: '#FCF4F2', paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }, deleteButtonText: { color: '#A54E43', fontSize: 11, fontWeight: '800' }, mergeSheet: { maxHeight: '78%', backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: 28 }, mergeList: { gap: 9, paddingBottom: 8 }, mergeOption: { minHeight: 76, borderRadius: 16, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, padding: 9, flexDirection: 'row', alignItems: 'center' }, mergeOptionImage: { width: 58, height: 58, borderRadius: 11, backgroundColor: COLORS.sand, marginRight: 11 }, mergeOptionCopy: { flex: 1 }, mergeOptionTitle: { color: COLORS.ink, fontSize: 12, fontWeight: '800' }, mergeOptionMeta: { color: COLORS.muted, fontSize: 9, marginTop: 5, textTransform: 'capitalize' }, noMergeOptions: { color: COLORS.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', paddingVertical: 32 }, editGarmentSheet: { height: '88%', backgroundColor: COLORS.paper, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: 24 }, saveEditButton: { height: 52, borderRadius: 16, backgroundColor: COLORS.clay, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, marginTop: 12 }, saveEditButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
   outfitEvaluation: { backgroundColor: '#EEF2EA', borderRadius: 19, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: '#DCE5D7' }, outfitEvaluationHead: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 }, evaluationEyebrow: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800', letterSpacing: 1.1, marginBottom: 4 }, evaluationTitle: { color: COLORS.ink, fontSize: 17, fontWeight: '700' }, evaluationScore: { width: 58, height: 58, borderRadius: 29, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center', marginLeft: 10 }, evaluationScoreValue: { color: COLORS.sageDark, fontSize: 21, fontWeight: '800', lineHeight: 23 }, evaluationScoreMax: { color: COLORS.muted, fontSize: 9 }, evaluationSummary: { color: COLORS.ink, fontSize: 12, lineHeight: 18, marginBottom: 5 }, evaluationBlock: { marginTop: 10 }, evaluationBlockTitle: { color: COLORS.ink, fontSize: 12, fontWeight: '800', marginBottom: 6 }, evaluationRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginTop: 5 }, evaluationRowText: { flex: 1, color: COLORS.muted, fontSize: 11, lineHeight: 16 },

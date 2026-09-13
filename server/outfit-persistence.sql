@@ -10,6 +10,12 @@ alter table public.outfit_garments
 alter table public.outfit_garments
   add column if not exists confidence numeric not null default 0;
 
+alter table public.garments
+  add column if not exists thumbnail_path text;
+
+alter table public.outfits
+  add column if not exists thumbnail_path text;
+
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('outfit-images', 'outfit-images', false, 8388608, array['image/jpeg', 'image/png', 'image/webp'])
 on conflict (id) do update

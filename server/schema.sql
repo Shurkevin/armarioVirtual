@@ -18,6 +18,7 @@ create table if not exists public.garments (
   material_confidence numeric not null default 0,
   confidence numeric not null default 0,
   image_path text not null,
+  thumbnail_path text,
   wear_count integer not null default 1 check (wear_count >= 0),
   scan_fingerprint jsonb,
   created_at timestamptz not null default now(),
@@ -28,6 +29,7 @@ create table if not exists public.outfits (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
   image_path text not null,
+  thumbnail_path text,
   evaluation jsonb,
   style_goal text,
   taken_at timestamptz not null default now(),
@@ -45,6 +47,8 @@ create table if not exists public.outfit_garments (
 
 -- Compatible con instalaciones que ya tenían la tabla creada.
 alter table public.outfits add column if not exists style_goal text;
+alter table public.garments add column if not exists thumbnail_path text;
+alter table public.outfits add column if not exists thumbnail_path text;
 alter table public.outfit_garments add column if not exists item_box jsonb not null default '{"xMin":0,"yMin":0,"xMax":1000,"yMax":1000}'::jsonb;
 alter table public.outfit_garments add column if not exists display_rotation integer not null default 0;
 alter table public.outfit_garments add column if not exists confidence numeric not null default 0;
@@ -55,6 +59,25 @@ create table if not exists public.garment_usage_events (
   garment_id uuid not null references public.garments(id) on delete cascade,
   outfit_id uuid references public.outfits(id) on delete set null,
   used_at timestamptz not null default now()
+);
+
+create table if not exists public.garment_comparison_cache (
+  id bigint generated always as identity primary key,
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  saved_garment_id uuid references public.garments(id) on delete cascade,
+  candidate_hash text not null,
+  saved_hash text not null,
+  candidate_digest text not null,
+  saved_digest text not null,
+  model text not null,
+  retry_model text not null default '',
+  thinking_level text not null,
+  prompt_version text not null,
+  result jsonb not null,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (user_id, candidate_digest, saved_digest, model, retry_model, thinking_level, prompt_version)
 );
 
 create table if not exists public.analysis_runs (
@@ -90,12 +113,15 @@ create table if not exists public.analysis_runs (
 create index if not exists garments_user_id_idx on public.garments(user_id);
 create index if not exists outfits_user_id_idx on public.outfits(user_id);
 create index if not exists usage_garment_id_idx on public.garment_usage_events(garment_id);
+create index if not exists garment_comparison_cache_lookup_idx
+  on public.garment_comparison_cache(user_id, candidate_digest, saved_digest, expires_at desc);
 create index if not exists analysis_runs_user_created_idx on public.analysis_runs(user_id, created_at desc);
 
 alter table public.garments enable row level security;
 alter table public.outfits enable row level security;
 alter table public.outfit_garments enable row level security;
 alter table public.garment_usage_events enable row level security;
+alter table public.garment_comparison_cache enable row level security;
 alter table public.analysis_runs enable row level security;
 
 drop policy if exists "Users manage their garments" on public.garments;
@@ -110,6 +136,9 @@ create policy "Users manage outfit garments" on public.outfit_garments
   with check (exists (select 1 from public.outfits o where o.id = outfit_id and o.user_id = auth.uid()));
 drop policy if exists "Users manage their usage events" on public.garment_usage_events;
 create policy "Users manage their usage events" on public.garment_usage_events
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+drop policy if exists "Users manage their comparison cache" on public.garment_comparison_cache;
+create policy "Users manage their comparison cache" on public.garment_comparison_cache
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 drop policy if exists "Users insert their analysis runs" on public.analysis_runs;
 create policy "Users insert their analysis runs" on public.analysis_runs

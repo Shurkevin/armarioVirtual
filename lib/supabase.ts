@@ -34,6 +34,7 @@ export type DatabaseGarmentRow = {
   material_confidence: number;
   confidence: number;
   image_path: string;
+  thumbnail_path: string | null;
   wear_count: number;
   scan_fingerprint: Record<string, unknown> | null;
   created_at: string;
@@ -44,6 +45,7 @@ export type DatabaseOutfitRow = {
   id: string;
   user_id: string;
   image_path: string;
+  thumbnail_path: string | null;
   evaluation: Record<string, unknown> | null;
   style_goal: string | null;
   taken_at: string;
