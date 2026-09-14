@@ -32,6 +32,7 @@
     "multer": "^2.3.0",
     "react": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-google-mobile-ads": "16.3.4",
     "sharp": "^0.35.4"
   },
   "devDependencies": {

@@ -14,7 +14,9 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .map((origin) => origin.trim())
   .filter(Boolean);
 const GEMINI_RETRY_DELAYS_MS = [2500, 6000, 12000];
-const OUTFIT_STYLE_GOALS = new Set(['Casual', 'Minimalista', 'Clásico', 'Urbano', 'Deportivo', 'Elegante']);
+const NO_SPECIFIC_OCCASION = 'Ninguna en concreto';
+const OUTFIT_OCCASIONS = new Set(['Día a día', 'Trabajo o estudios', 'Salir, cena o cita', 'Evento o celebración', 'Actividad o deporte', NO_SPECIFIC_OCCASION]);
+const LEGACY_OUTFIT_STYLE_GOALS = new Set(['Casual', 'Minimalista', 'Clásico', 'Urbano', 'Deportivo', 'Elegante']);
 const COMPARISON_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const COMPARISON_CACHE_MAX_ENTRIES = 500;
 const COMPARISON_PROMPT_VERSION = 'v4';
@@ -401,12 +403,14 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
   let providerAttemptCount = 0;
   let postprocessStartedAt;
   let postprocessDurationMs;
-  const requestedStyleGoal = OUTFIT_STYLE_GOALS.has(request.body?.styleGoal) ? request.body.styleGoal : null;
+  const requestedOccasion = OUTFIT_OCCASIONS.has(request.body?.occasion) ? request.body.occasion : NO_SPECIFIC_OCCASION;
+  const requestedStyleGoal = LEGACY_OUTFIT_STYLE_GOALS.has(request.body?.styleGoal) ? request.body.styleGoal : null;
   const log = (message) => console.log(`[${new Date().toISOString()}] [${requestId}] ${message}`);
   const analysisMeta = () => ({
     requestId,
     model: effectiveModel,
     fallbackUsed,
+    occasion: requestedOccasion,
     styleGoal: requestedStyleGoal,
     serverDurationMs: Date.now() - startedAt,
     providerDurationMs: providerDurationMs
@@ -424,7 +428,11 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
     return sendError(400, 'Falta la foto.');
   }
   log(`Foto recibida: ${request.file.mimetype}, ${(request.file.size / 1024 / 1024).toFixed(2)} MB.`);
-  log(requestedStyleGoal ? `Objetivo de estilo: ${requestedStyleGoal}.` : 'No se ha indicado objetivo de estilo.');
+  log(requestedOccasion !== NO_SPECIFIC_OCCASION
+    ? `Ocasión indicada: ${requestedOccasion}.`
+    : requestedStyleGoal
+      ? `Objetivo de estilo de una versión anterior de la app: ${requestedStyleGoal}.`
+      : 'No se ha indicado una ocasión concreta.');
 
   if (!process.env.GEMINI_API_KEY) {
     log('Solicitud rechazada: GEMINI_API_KEY no está configurada.');
@@ -461,11 +469,13 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
             { text: 'No incluyas gafas, gafas de sol, anteojos, lentes ni ningún tipo de eyewear entre las prendas o accesorios. Tampoco incluyas auriculares, cascos de audio, earbuds, AirPods ni ningún otro dispositivo de sonido.' },
             { text: 'Prioriza la identificación del tipo o construcción visible del tejido en fabricType (por ejemplo punto, tejido plano, denim, pana, cuero, encaje o tejido técnico) y su textura. La composición de fibras en materialEstimate es secundaria y rara vez puede saberse por una foto: no dediques esfuerzo a adivinarla; si no hay evidencia visual clara devuelve “no determinable” o una estimación prudente con materialConfidence baja.' },
             { text: 'No tengas en cuenta bebés ni niños muy pequeños: no los devuelvas como personas seleccionables, no enumeres sus prendas y no confundas su ropa o accesorios con los de los adultos que aparecen en la foto. Si hay al menos uno claramente visible, establece youngChildDetected en true; úsalo únicamente como señal de exclusión, sin estimar edades ni describir al menor.' },
-            { text: requestedStyleGoal
-              ? `El usuario busca un resultado de estilo ${requestedStyleGoal}. Evalúa el outfit específicamente respecto a ese objetivo: valora si silueta, proporciones, paleta, prendas, tejidos y acabados son coherentes con ${requestedStyleGoal}. No lo penalices por no responder a otros estilos; si no encaja, explica qué cambios estéticos visibles lo acercarían a ${requestedStyleGoal}.`
-              : 'No se ha indicado un objetivo de estilo. Evalúa el outfit de forma general, basándote únicamente en su coherencia visual.' },
+            { text: requestedOccasion !== NO_SPECIFIC_OCCASION
+              ? `El usuario quiere usar este outfit para: ${requestedOccasion}. Evalúalo específicamente para ese contexto, atendiendo a su coherencia visual, nivel de formalidad, acabado y adecuación estilística. No inventes un código de vestimenta que el usuario no haya indicado. Si puede funcionar mejor para esa ocasión, propón cambios estéticos concretos y visibles.`
+              : requestedStyleGoal
+                ? `El usuario busca un resultado de estilo ${requestedStyleGoal}. Evalúa el outfit específicamente respecto a ese objetivo: valora si silueta, proporciones, paleta, prendas, tejidos y acabados son coherentes con ${requestedStyleGoal}. No lo penalices por no responder a otros estilos; si no encaja, explica qué cambios estéticos visibles lo acercarían a ${requestedStyleGoal}.`
+                : 'El usuario no busca una ocasión concreta. Evalúa el outfit de forma general, basándote en su coherencia visual, y no presupongas un contexto de uso.' },
             { text: 'En la valoración del outfit usa un criterio positivo y ligeramente más generoso: un conjunto bien coordinado y apropiado puede estar en 80-89; reserva 90-94 para conjuntos especialmente logrados y 95-100 solo para resultados excepcionales. Usa notas inferiores a 70 únicamente si hay problemas visuales claros y relevantes.' },
-            { text: 'Detecta las personas visibles y valora para cada una foregroundSubject y prominence entre 0 y 1. Ordénalas de izquierda a derecha y asigna ids consecutivos empezando por 1. Describe su posición brevemente sin usar rasgos personales. Indica si su cara es visible y devuelve faceBox con xMin, yMin, xMax e yMax entre 0 y 1000; si no es visible usa ceros. Para cada persona enumera las prendas y accesorios que lleva y genera outfitEvaluation: una valoración breve y amable basada solo en lo visible del conjunto (coordinación de colores, equilibrio, ocasión y acabado), con score de 0 a 100, summary, 1-3 strengths, 1-3 improvements y 1-3 suggestions accionables de vestimenta que harían que el conjunto combinase o se viera mejor. Usa una escala exigente y amplia: 50-59 es un conjunto correcto pero con varios aspectos visuales mejorables; 60-69 es bueno; 70-79 muy bueno; 80-89 excelente y coherente; 90-94 sobresaliente; reserva 95-100 para estilismos excepcionales, impecables y especialmente memorables. No concentres las puntuaciones entre 80 y 88: penaliza de forma proporcionada incompatibilidades de color, proporción, formalidad, acabado o falta de intención estilística. Las mejoras deben ser exclusivamente estéticas y de styling: no recomiendes prendas por el clima, comodidad, protección, utilidad, seguridad ni planes hipotéticos (por ejemplo, no sugieras añadir una chaqueta por si cambia el tiempo). No juzgues el cuerpo, atractivo, género, edad ni rasgos personales, y no inventes prendas que no se vean. Para cada prenda devuelve itemBox, un rectángulo lo más ajustado posible con xMin, yMin, xMax e yMax entre 0 y 1000. Incluye categoría, subcategoría, color principal, colores secundarios, estilos, estampado, marca claramente visible en brand (o cadena vacía), composición aparente en materialEstimate, tipo de construcción en fabricType, textura visible en texture, confianza específica del material entre 0 y 1 y confianza general entre 0 y 1. En el color sé preciso y descriptivo. Usa nombres canónicos en español, en singular y forma base: “beige” (no “beis”), “marrón” (no “café”), “rosa” (no “rosado”), “caqui” (no “kaki” ni “khaki”) y “fucsia” (no “fuchsia”). Conserva matices como claro, oscuro, pastel o marino. El color principal debe incluir la combinación cuando la prenda tenga varios colores visibles (por ejemplo, “blanco y negro” para una camisa de rayas blancas y negras), colores secundarios debe listar todos los colores claramente apreciables y su orden no importa. No uses solo el color dominante ni omitas rayas, cuadros, bloques o estampados bicolor; si un color ocupa una parte relevante, inclúyelo aunque sea secundario.' },
+            { text: 'Detecta las personas visibles y valora para cada una foregroundSubject y prominence entre 0 y 1. Ordénalas de izquierda a derecha y asigna ids consecutivos empezando por 1. Describe su posición brevemente sin usar rasgos personales. Indica si su cara es visible y devuelve faceBox con xMin, yMin, xMax e yMax entre 0 y 1000; si no es visible usa ceros. Para cada persona enumera las prendas y accesorios que lleva y genera outfitEvaluation: una valoración breve y amable basada solo en lo visible del conjunto (coordinación de colores, equilibrio, ocasión y acabado), con score de 0 a 100, summary, detectedStyles con 1-3 estilos estéticos reconocibles del conjunto, 1-3 strengths, 1-3 improvements y 1-3 suggestions accionables de vestimenta que harían que el conjunto combinase o se viera mejor. Usa nombres de estilo claros y habituales en español, sin deducir rasgos personales. Usa una escala exigente y amplia: 50-59 es un conjunto correcto pero con varios aspectos visuales mejorables; 60-69 es bueno; 70-79 muy bueno; 80-89 excelente y coherente; 90-94 sobresaliente; reserva 95-100 para estilismos excepcionales, impecables y especialmente memorables. No concentres las puntuaciones entre 80 y 88: penaliza de forma proporcionada incompatibilidades de color, proporción, formalidad, acabado o falta de intención estilística. Las mejoras deben ser exclusivamente estéticas y de styling: no recomiendes prendas por el clima, comodidad, protección, utilidad, seguridad ni planes hipotéticos (por ejemplo, no sugieras añadir una chaqueta por si cambia el tiempo). No juzgues el cuerpo, atractivo, género, edad ni rasgos personales, y no inventes prendas que no se vean. Para cada prenda devuelve itemBox, un rectángulo lo más ajustado posible con xMin, yMin, xMax e yMax entre 0 y 1000. Incluye categoría, subcategoría, color principal, colores secundarios, estilos, estampado, marca claramente visible en brand (o cadena vacía), composición aparente en materialEstimate, tipo de construcción en fabricType, textura visible en texture, confianza específica del material entre 0 y 1 y confianza general entre 0 y 1. En el color sé preciso y descriptivo. Usa nombres canónicos en español, en singular y forma base: “beige” (no “beis”), “marrón” (no “café”), “rosa” (no “rosado”), “caqui” (no “kaki” ni “khaki”) y “fucsia” (no “fuchsia”). Conserva matices como claro, oscuro, pastel o marino. El color principal debe incluir la combinación cuando la prenda tenga varios colores visibles (por ejemplo, “blanco y negro” para una camisa de rayas blancas y negras), colores secundarios debe listar todos los colores claramente apreciables y su orden no importa. No uses solo el color dominante ni omitas rayas, cuadros, bloques o estampados bicolor; si un color ocupa una parte relevante, inclúyelo aunque sea secundario.' },
             { inlineData: { mimeType: request.file.mimetype, data: request.file.buffer.toString('base64') } },
           ],
         }],
@@ -506,10 +516,11 @@ app.post('/analyze-outfit', upload.single('photo'), async (request, response) =>
                       type: 'object', additionalProperties: false,
                       properties: {
                         score: { type: 'number' }, summary: { type: 'string' },
+                        detectedStyles: { type: 'array', items: { type: 'string' } },
                         strengths: { type: 'array', items: { type: 'string' } },
                         improvements: { type: 'array', items: { type: 'string' } },
                         suggestions: { type: 'array', items: { type: 'string' } },
-                      }, required: ['score', 'summary', 'strengths', 'improvements', 'suggestions'],
+                      }, required: ['score', 'summary', 'detectedStyles', 'strengths', 'improvements', 'suggestions'],
                     },
                     items: {
                       type: 'array',

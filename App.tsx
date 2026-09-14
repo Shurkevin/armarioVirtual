@@ -29,6 +29,7 @@ import { File } from 'expo-file-system';
 import { makeRedirectUri } from 'expo-auth-session';
 import * as Linking from 'expo-linking';
 import * as WebBrowser from 'expo-web-browser';
+import mobileAds, { AdsConsent, AdsConsentPrivacyOptionsRequirementStatus, BannerAd, BannerAdSize, TestIds } from 'react-native-google-mobile-ads';
 import { supabase } from './lib/supabase';
 import type { DatabaseGarmentRow, DatabaseOutfitRow } from './lib/supabase';
 
@@ -82,7 +83,7 @@ type Garment = {
   displayRotation: number;
 };
 type FaceBox = { xMin: number; yMin: number; xMax: number; yMax: number };
-type OutfitEvaluation = { score: number; summary: string; strengths: string[]; improvements: string[]; suggestions: string[] };
+type OutfitEvaluation = { score: number; summary: string; detectedStyles?: string[]; strengths: string[]; improvements: string[]; suggestions: string[] };
 type PersonAnalysis = { id: number; position: string; faceVisible: boolean; faceBox: FaceBox; items: Garment[]; outfitEvaluation?: OutfitEvaluation };
 type AnalysisMeta = {
   requestId?: string;
@@ -116,9 +117,9 @@ type PreparedDuplicateChecks = {
   croppedItems: SavedGarment[];
   matches: DuplicateMatch[];
 };
-type OutfitDraft = { imageUri: string; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
+type OutfitDraft = { imageUri: string; evaluation: OutfitEvaluation | null; occasion: string; createdAt: string };
 type DuplicateReview = { croppedItems: SavedGarment[]; appearanceItems: SavedGarment[]; matchedGarmentIds: Record<string, string>; outfit: OutfitDraft; matches: DuplicateMatch[]; wornItemIds: string[]; updatedItems: SavedGarment[] };
-type SavedOutfit = { id: string; imageUri: string; thumbnailUri?: string; storagePath?: string; thumbnailStoragePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; styleGoal: string; createdAt: string };
+type SavedOutfit = { id: string; imageUri: string; thumbnailUri?: string; storagePath?: string; thumbnailStoragePath?: string; garments: SavedGarment[]; evaluation: OutfitEvaluation | null; occasion: string; createdAt: string };
 type NoticeAction = { label: string; onPress?: () => void; destructive?: boolean };
 type Notice = { title: string; message: string; actions?: NoticeAction[] };
 const NoticeContext = createContext<{ showNotice: (notice: Notice) => void }>({ showNotice: () => undefined });
@@ -506,6 +507,32 @@ const analysisMessages = [
   'Tu outfit está casi listo',
 ];
 
+type AdPlacement = 'analysis' | 'preparation';
+
+const productionBannerId = (placement: AdPlacement) => {
+  if (Platform.OS === 'android') {
+    return placement === 'analysis'
+      ? process.env.EXPO_PUBLIC_ADMOB_ANDROID_ANALYSIS_BANNER_ID
+      : process.env.EXPO_PUBLIC_ADMOB_ANDROID_PREPARATION_BANNER_ID;
+  }
+  return undefined;
+};
+
+function ProcessingAd({ placement, adsReady }: { placement: AdPlacement; adsReady: boolean }) {
+  const unitId = __DEV__ ? TestIds.BANNER : productionBannerId(placement);
+  if (Platform.OS !== 'android' || !unitId) return null;
+
+  return <View style={styles.processingAdArea} accessibilityLabel="Espacio publicitario">
+    <Text style={styles.processingAdLabel}>PUBLICIDAD</Text>
+    <View style={styles.processingAdBanner}>
+      {adsReady && <BannerAd
+        unitId={unitId}
+        size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
+      />}
+    </View>
+  </View>;
+}
+
 function LoadingDecorations({ visible }: { visible: boolean }) {
   const topMotion = useState(() => new Animated.Value(0))[0];
   const bottomMotion = useState(() => new Animated.Value(0))[0];
@@ -523,7 +550,7 @@ function LoadingDecorations({ visible }: { visible: boolean }) {
   return <><Animated.View style={[styles.loadingDecorationTop, { transform: [{ translateX: topMotion.interpolate({ inputRange: [0, 1], outputRange: [80, -420] }) }, { translateY: topMotion.interpolate({ inputRange: [0, 1], outputRange: [-45, 640] }) }, { scale: topMotion.interpolate({ inputRange: [0, 1], outputRange: [1.08, 0.88] }) }] }]} /><Animated.View style={[styles.loadingDecorationBottom, { transform: [{ translateX: bottomMotion.interpolate({ inputRange: [0, 1], outputRange: [-70, 420] }) }, { translateY: bottomMotion.interpolate({ inputRange: [0, 1], outputRange: [90, -690] }) }, { scale: bottomMotion.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1.12] }) }] }]} /></>;
 }
 
-function AnalysisLoading({ visible }: { visible: boolean }) {
+function AnalysisLoading({ visible, adsReady }: { visible: boolean; adsReady: boolean }) {
   const [messageIndex, setMessageIndex] = useState(0);
 
   useEffect(() => {
@@ -545,6 +572,7 @@ function AnalysisLoading({ visible }: { visible: boolean }) {
         <Text style={styles.loadingText}>Gemini está separando y clasificando las prendas de tu foto.</Text>
         <ActivityIndicator size="small" color={COLORS.sageDark} style={styles.loadingSpinner} />
       </View>
+      {visible && <ProcessingAd placement="analysis" adsReady={adsReady} />}
     </SafeAreaView>
   </Modal>;
 }
@@ -572,7 +600,7 @@ const preparationMessages = [
   'Terminando de organizarlo todo',
 ];
 
-function PreparationLoading({ visible }: { visible: boolean }) {
+function PreparationLoading({ visible, adsReady }: { visible: boolean; adsReady: boolean }) {
   const [messageIndex, setMessageIndex] = useState(0);
   useEffect(() => {
     if (!visible) {
@@ -593,6 +621,7 @@ function PreparationLoading({ visible }: { visible: boolean }) {
         <Text style={styles.loadingText}>Estamos preparando las imágenes y comprobando que no hayas guardado antes la misma prenda.</Text>
         <ActivityIndicator size="small" color={COLORS.sageDark} style={styles.loadingSpinner} />
       </View>
+      {visible && <ProcessingAd placement="preparation" adsReady={adsReady} />}
     </SafeAreaView>
   </Modal>;
 }
@@ -766,6 +795,16 @@ function LoginScreen() {
 const STYLE_OPTIONS = ['Casual', 'Minimalista', 'Clásico', 'Urbano', 'Deportivo', 'Elegante'];
 const STYLE_DESCRIPTIONS: Record<string, string> = { Casual: 'Fácil · relajado', Minimalista: 'Limpio · esencial', Clásico: 'Atemporal · pulido', Urbano: 'Actual · expresivo', Deportivo: 'Activo · funcional', Elegante: 'Refinado · especial' };
 const STYLE_ACCENTS: Record<string, string> = { Casual: '#D98567', Minimalista: '#BFCBB4', Clásico: '#C9B69D', Urbano: '#9699A8', Deportivo: '#9DB6A5', Elegante: '#B7A0A1' };
+const NO_SPECIFIC_OCCASION = 'Ninguna en concreto';
+const OUTFIT_OCCASIONS: Array<{ label: string; description: string; icon: keyof typeof Feather.glyphMap }> = [
+  { label: 'Día a día', description: 'Rutina y planes informales', icon: 'sun' },
+  { label: 'Trabajo o estudios', description: 'Un contexto profesional', icon: 'briefcase' },
+  { label: 'Salir, cena o cita', description: 'Un plan especial', icon: 'coffee' },
+  { label: 'Evento o celebración', description: 'Una ocasión señalada', icon: 'star' },
+  { label: 'Actividad o deporte', description: 'Un plan activo', icon: 'activity' },
+  { label: NO_SPECIFIC_OCCASION, description: 'Valoración general', icon: 'circle' },
+];
+const isKnownOccasion = (value: string) => OUTFIT_OCCASIONS.some((option) => option.label === value);
 const COLOR_OPTIONS = ['Negro', 'Blanco', 'Azul', 'Beige', 'Marrón', 'Verde', 'Rojo', 'Rosa'];
 const COLOR_SWATCHES: Record<string, string> = { Negro: '#252422', Blanco: '#F4F1EA', Azul: '#758DA5', Beige: '#DCCCB6', Marrón: '#8A6650', Verde: '#809078', Rojo: '#B9655A', Rosa: '#D4A1A2' };
 const BRAND_OPTIONS = [
@@ -875,17 +914,18 @@ function OnboardingScreen({ onComplete, initialName, initialGender, initialStyle
   </SafeAreaView>;
 }
 
-function Profile({ onBack, email, displayName, onSignOut, onEditSetup }: { onBack: () => void; email?: string; displayName?: string; onSignOut: () => void; onEditSetup: () => void }) {
+function Profile({ onBack, email, displayName, onSignOut, onEditSetup, onOpenAdPrivacy }: { onBack: () => void; email?: string; displayName?: string; onSignOut: () => void; onEditSetup: () => void; onOpenAdPrivacy?: () => void }) {
   return <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
     <View style={{ height: 18 }} />
     <TouchableOpacity style={styles.backButton} onPress={onBack}><Feather name="arrow-left" size={19} color={COLORS.ink} /><Text style={styles.backButtonText}>Volver</Text></TouchableOpacity>
     <View style={{ marginTop: 12, marginBottom: 30 }}><Text style={styles.eyebrow}>MI PERFIL</Text><Text style={styles.title}>{displayName || email?.split('@')[0] || 'Mi cuenta'}</Text><Text style={styles.addIntro}>{email || 'Tus preferencias y datos de estilo.'}</Text></View>
     <TouchableOpacity onPress={onEditSetup} style={styles.homeWardrobeEmpty} accessibilityRole="button" accessibilityLabel="Abrir configuración inicial"><View style={styles.homeWardrobeEmptyIcon}><Feather name="sliders" size={21} color={COLORS.sageDark} /></View><View style={styles.homeWardrobeEmptyCopy}><Text style={styles.homeWardrobeEmptyTitle}>Configuración inicial</Text><Text style={styles.homeWardrobeEmptyText}>Actualiza tu nombre, género, estilo, colores y marcas favoritas.</Text></View><Feather name="chevron-right" size={18} color={COLORS.muted} /></TouchableOpacity>
+    {onOpenAdPrivacy && <TouchableOpacity onPress={onOpenAdPrivacy} style={[styles.homeWardrobeEmpty, { marginTop: 10 }]} accessibilityRole="button" accessibilityLabel="Abrir opciones de privacidad de anuncios"><View style={styles.homeWardrobeEmptyIcon}><Feather name="shield" size={21} color={COLORS.sageDark} /></View><View style={styles.homeWardrobeEmptyCopy}><Text style={styles.homeWardrobeEmptyTitle}>Privacidad de anuncios</Text><Text style={styles.homeWardrobeEmptyText}>Revisa o cambia tus opciones de consentimiento.</Text></View><Feather name="chevron-right" size={18} color={COLORS.muted} /></TouchableOpacity>}
     <TouchableOpacity onPress={onSignOut} style={styles.signOutButton}><Feather name="log-out" size={17} color="#A54E43" /><Text style={styles.signOutButtonText}>Cerrar sesión</Text></TouchableOpacity>
   </ScrollView>;
 }
 
-function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitScore = true, showImprovementPoints = true }: { onSave: (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[], outfit: OutfitDraft, appearanceItems: SavedGarment[], matchedGarmentIds: Record<string, string>) => Promise<void>; wardrobeItems: SavedGarment[]; startWithCamera?: boolean; showOutfitScore?: boolean; showImprovementPoints?: boolean }) {
+function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitScore = true, showImprovementPoints = true, adsReady }: { onSave: (items: SavedGarment[], wornItemIds: string[], updatedItems: SavedGarment[], outfit: OutfitDraft, appearanceItems: SavedGarment[], matchedGarmentIds: Record<string, string>) => Promise<void>; wardrobeItems: SavedGarment[]; startWithCamera?: boolean; showOutfitScore?: boolean; showImprovementPoints?: boolean; adsReady: boolean }) {
   const { showNotice } = useNotice();
   const [stage, setStage] = useState<AddStage>('upload');
   const [imageUri, setImageUri] = useState<string | null>(null);
@@ -905,7 +945,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   const [duplicateIndex, setDuplicateIndex] = useState(0);
   const [comparisonFullScreenImage, setComparisonFullScreenImage] = useState<string | null>(null);
   const [outfitEvaluation, setOutfitEvaluation] = useState<OutfitEvaluation | null>(null);
-  const [styleGoal, setStyleGoal] = useState<string | null>(null);
+  const [occasion, setOccasion] = useState(NO_SPECIFIC_OCCASION);
   const [youngChildDetected, setYoungChildDetected] = useState(false);
   const [noOutfitFound, setNoOutfitFound] = useState(false);
   const [photoSource, setPhotoSource] = useState<'gallery' | 'camera' | null>(null);
@@ -951,7 +991,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       duplicateChecksRef.current = null;
       setCheckingDuplicates(false);
       setOutfitEvaluation(null);
-      setStyleGoal(null);
+      setOccasion(NO_SPECIFIC_OCCASION);
       setYoungChildDetected(false);
       setNoOutfitFound(false);
       setStage('upload');
@@ -987,7 +1027,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         setPhotoDate(metadataDate ? parsePhotoDate(metadataDate as string | number) : new Date().toISOString());
         setAskForPhotoDate(false);
         setManualPhotoDate('');
-        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); duplicateChecksRef.current = null; setCheckingDuplicates(false); setOutfitEvaluation(null); setStyleGoal(null); setYoungChildDetected(false); setStage('upload');
+        setGarments([]); setPeople([]); setSelectedPersonId(null); setFaceThumbnails({}); setExcludedGarments([]); setDuplicateReview(null); setDuplicateIndex(0); duplicateChecksRef.current = null; setCheckingDuplicates(false); setOutfitEvaluation(null); setOccasion(NO_SPECIFIC_OCCASION); setYoungChildDetected(false); setStage('upload');
         setNoOutfitFound(false);
       }
     } catch (error) {
@@ -1032,10 +1072,6 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
 
   const analyzeOutfit = async () => {
     if (!imageUri) return;
-    if (!styleGoal) {
-      showNotice({ title: 'Elige un objetivo de estilo', message: 'Así valoraremos el outfit según lo que buscas conseguir.' });
-      return;
-    }
     const startedAt = Date.now();
     let status: 'completed' | 'failed' = 'failed';
     let httpStatus: number | null = null;
@@ -1064,7 +1100,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         imageSizeBytes = null;
       }
       const form = new FormData();
-      form.append('styleGoal', styleGoal);
+      form.append('occasion', occasion);
       form.append('photo', { uri: aiImage.uri, name: 'outfit.jpg', type: aiImage.uri === imageUri ? imageType : 'image/jpeg' } as unknown as Blob);
       await waitForBackendWarmup();
       requestStartedAt = Date.now();
@@ -1135,7 +1171,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         garment_count: garmentCount,
         model: analysisMeta.model || null,
         request_id: analysisMeta.requestId || null,
-        style_goal: styleGoal,
+        style_goal: occasion,
       });
     }
   };
@@ -1376,7 +1412,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
           croppedItems,
           appearanceItems: croppedItems,
           matchedGarmentIds: {},
-          outfit: { imageUri, evaluation: outfitEvaluation, styleGoal: styleGoal || '', createdAt: photoDate || new Date().toISOString() },
+          outfit: { imageUri, evaluation: outfitEvaluation, occasion, createdAt: photoDate || new Date().toISOString() },
           matches: visualMatches,
           wornItemIds: [],
           updatedItems: [],
@@ -1385,7 +1421,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
         setStage('duplicates');
         return;
       }
-      await onSave(croppedItems, [], [], { imageUri, evaluation: outfitEvaluation, styleGoal: styleGoal || '', createdAt: photoDate || new Date().toISOString() }, croppedItems, {});
+      await onSave(croppedItems, [], [], { imageUri, evaluation: outfitEvaluation, occasion, createdAt: photoDate || new Date().toISOString() }, croppedItems, {});
     } finally {
       setSaving(false);
     }
@@ -1416,8 +1452,9 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   </View>;
 
   const renderOutfitEvaluation = () => outfitEvaluation ? <View style={styles.outfitEvaluation}>
-    <View style={styles.outfitEvaluationHead}><View style={{ flex: 1 }}><Text style={styles.evaluationEyebrow}>VALORACIÓN · OBJETIVO: {styleGoal?.toLocaleUpperCase('es')}</Text><Text style={styles.evaluationTitle}>Cómo funciona tu conjunto</Text></View>{showOutfitScore && <View style={styles.evaluationScore}><Text style={styles.evaluationScoreValue}>{Math.round(outfitEvaluation.score)}</Text><Text style={styles.evaluationScoreMax}>/100</Text></View>}</View>
+    <View style={styles.outfitEvaluationHead}><View style={{ flex: 1 }}><Text style={styles.evaluationEyebrow}>{occasion === NO_SPECIFIC_OCCASION ? 'VALORACIÓN GENERAL' : `VALORACIÓN · ${occasion.toLocaleUpperCase('es')}`}</Text><Text style={styles.evaluationTitle}>Cómo funciona tu conjunto</Text></View>{showOutfitScore && <View style={styles.evaluationScore}><Text style={styles.evaluationScoreValue}>{Math.round(outfitEvaluation.score)}</Text><Text style={styles.evaluationScoreMax}>/100</Text></View>}</View>
     <Text style={styles.evaluationSummary}>{outfitEvaluation.summary}</Text>
+    {outfitEvaluation.detectedStyles && outfitEvaluation.detectedStyles.length > 0 && <View style={{ alignSelf: 'flex-start', backgroundColor: COLORS.white, borderRadius: 999, paddingHorizontal: 11, paddingVertical: 7, marginTop: 11, borderWidth: 1, borderColor: COLORS.line }}><Text style={{ color: COLORS.sageDark, fontSize: 10, fontWeight: '800' }}>ESTILO DETECTADO · {outfitEvaluation.detectedStyles.join(' · ').toLocaleUpperCase('es')}</Text></View>}
     {outfitEvaluation.strengths?.length > 0 && <View style={styles.evaluationBlock}><Text style={styles.evaluationBlockTitle}>Lo que funciona</Text>{outfitEvaluation.strengths.map((text, index) => <View style={styles.evaluationRow} key={`strength-${index}`}><Feather name="check-circle" size={15} color={COLORS.sageDark} /><Text style={styles.evaluationRowText}>{text}</Text></View>)}</View>}
     {showImprovementPoints && outfitEvaluation.improvements?.length > 0 && <View style={styles.evaluationBlock}><Text style={styles.evaluationBlockTitle}>Podría mejorar</Text>{outfitEvaluation.improvements.map((text, index) => <View style={styles.evaluationRow} key={`improvement-${index}`}><Feather name="trending-up" size={15} color={COLORS.clay} /><Text style={styles.evaluationRowText}>{text}</Text></View>)}</View>}
     {showImprovementPoints && outfitEvaluation.suggestions?.length > 0 && <View style={styles.evaluationBlock}><Text style={styles.evaluationBlockTitle}>Ideas rápidas</Text>{outfitEvaluation.suggestions.map((text, index) => <View style={styles.evaluationRow} key={`suggestion-${index}`}><Feather name="plus" size={15} color={COLORS.muted} /><Text style={styles.evaluationRowText}>{text}</Text></View>)}</View>}
@@ -1517,7 +1554,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   </ScrollView>;
 
   if (stage === 'review') return <ScrollView contentContainerStyle={styles.stepScroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-    <PreparationLoading visible={saving} />
+    <PreparationLoading visible={saving} adsReady={adsReady} />
     <TouchableOpacity style={styles.backButton} onPress={() => setStage(people.length > 1 ? 'person' : 'upload')}><Feather name="arrow-left" size={19} color={COLORS.ink} /><Text style={styles.backButtonText}>{people.length > 1 ? 'Cambiar persona' : 'Volver'}</Text></TouchableOpacity>
     <View style={styles.reviewHero}>{imageUri && <Image source={{ uri: imageUri }} style={styles.reviewImage} />}<View style={styles.reviewHeroCopy}><Text style={styles.eyebrow}>REVISIÓN</Text><Text style={styles.reviewHeroTitle}>Revisa tu outfit</Text><Text style={styles.reviewHeroText}>Confirma los datos antes de añadirlos al armario.</Text></View></View>
     {youngChildDetected && <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: '#F2E2DA', borderRadius: 16, padding: 13, marginTop: 10 }}><Feather name="info" size={17} color={COLORS.clay} /><Text style={{ flex: 1, color: COLORS.ink, fontSize: 11, lineHeight: 16 }}>Hemos detectado un bebé o niño muy pequeño en la imagen. Sus prendas no se analizan ni se añaden al armario.</Text></View>}
@@ -1525,7 +1562,7 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
   </ScrollView>;
 
   return <ScrollView contentContainerStyle={styles.addScroll} showsVerticalScrollIndicator={false}>
-    <AnalysisLoading visible={analyzing} />
+    <AnalysisLoading visible={analyzing} adsReady={adsReady} />
     <View style={styles.addHeader}>
       <Text style={styles.eyebrow}>NUEVO OUTFIT</Text>
       <Text style={styles.title}>Añade una foto</Text>
@@ -1545,21 +1582,21 @@ function AddOutfit({ onSave, wardrobeItems, startWithCamera = false, showOutfitS
       </View>
       {askForPhotoDate && <View style={{ backgroundColor: '#F0F3EC', borderRadius: 16, padding: 14, marginTop: 12 }}><Text style={{ color: COLORS.ink, fontSize: 13, fontWeight: '700' }}>¿Cuándo llevaste este outfit?</Text><Text style={{ color: COLORS.muted, fontSize: 11, marginTop: 4, marginBottom: 10 }}>No hemos encontrado la fecha original de la foto. Es opcional.</Text><View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}><TextInput value={manualPhotoDate} onChangeText={(value) => { setManualPhotoDate(value); const parsed = /^\d{4}-\d{2}-\d{2}$/.test(value) ? parsePhotoDate(`${value}T12:00:00`) : null; setPhotoDate(parsed); }} placeholder="AAAA-MM-DD" placeholderTextColor="#AAA39C" style={[styles.fieldInput, { flex: 1, marginBottom: 0 }]} /><TouchableOpacity onPress={() => setAskForPhotoDate(false)}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>Omitir</Text></TouchableOpacity></View></View>}
       <View style={{ backgroundColor: COLORS.white, borderRadius: 16, padding: 14, marginTop: 12, borderWidth: 1, borderColor: COLORS.line }}>
-        <Text style={{ color: COLORS.ink, fontSize: 13, fontWeight: '700' }}>¿Qué estilo quieres conseguir?</Text>
-        <Text style={{ color: COLORS.muted, fontSize: 11, lineHeight: 16, marginTop: 4 }}>Evaluaremos el conjunto según ese objetivo, no según un estilo genérico.</Text>
+        <Text style={{ color: COLORS.ink, fontSize: 13, fontWeight: '700' }}>¿Para qué ocasión es este outfit?</Text>
+        <Text style={{ color: COLORS.muted, fontSize: 11, lineHeight: 16, marginTop: 4 }}>Adaptaremos la valoración al contexto. Si no buscas nada concreto, puedes continuar tal cual.</Text>
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
-          {STYLE_OPTIONS.map((option) => {
-            const selected = styleGoal === option;
-            return <TouchableOpacity key={option} onPress={() => setStyleGoal(option)} accessibilityRole="button" accessibilityLabel={`Buscar estilo ${option}`} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 999, paddingHorizontal: 11, paddingVertical: 8, backgroundColor: selected ? COLORS.sageDark : '#F0F3EC', borderWidth: 1, borderColor: selected ? COLORS.sageDark : '#DCE5D7' }}>
-              <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: selected ? COLORS.white : STYLE_ACCENTS[option] }} />
-              <Text style={{ color: selected ? COLORS.white : COLORS.sageDark, fontSize: 12, fontWeight: '700' }}>{option}</Text>
+          {OUTFIT_OCCASIONS.map((option) => {
+            const selected = occasion === option.label;
+            return <TouchableOpacity key={option.label} onPress={() => setOccasion(option.label)} accessibilityRole="radio" accessibilityState={{ checked: selected }} accessibilityLabel={`${option.label}. ${option.description}`} style={{ flexBasis: '47%', flexGrow: 1, minHeight: 68, borderRadius: 14, paddingHorizontal: 11, paddingVertical: 10, backgroundColor: selected ? COLORS.sageDark : '#F0F3EC', borderWidth: 1, borderColor: selected ? COLORS.sageDark : '#DCE5D7', flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
+              <Feather name={option.icon} size={15} color={selected ? COLORS.white : COLORS.sageDark} style={{ marginTop: 1 }} />
+              <View style={{ flex: 1 }}><Text style={{ color: selected ? COLORS.white : COLORS.ink, fontSize: 11, lineHeight: 15, fontWeight: '800' }}>{option.label}</Text><Text style={{ color: selected ? '#DDE5D8' : COLORS.muted, fontSize: 9, lineHeight: 13, marginTop: 3 }}>{option.description}</Text></View>
             </TouchableOpacity>;
           })}
         </View>
       </View>
-      <TouchableOpacity style={[styles.analyzeButton, (analyzing || !styleGoal) && styles.buttonDisabled]} onPress={analyzeOutfit} disabled={analyzing || !styleGoal}>
+      <TouchableOpacity style={[styles.analyzeButton, analyzing && styles.buttonDisabled]} onPress={analyzeOutfit} disabled={analyzing}>
         {analyzing ? <ActivityIndicator color={COLORS.white} /> : <Feather name="zap" size={18} color={COLORS.white} />}
-        <Text style={styles.analyzeButtonText}>{analyzing ? 'Analizando outfit…' : styleGoal ? 'Analizar prendas' : 'Elige un estilo para continuar'}</Text>
+        <Text style={styles.analyzeButtonText}>{analyzing ? 'Analizando outfit…' : 'Analizar prendas'}</Text>
       </TouchableOpacity>
       {people.length === 0 && !analyzing && imageUri && <Text style={styles.analysisNote}>Pulsa “Analizar prendas” para detectar a las personas y sus outfits.</Text>}
       <TouchableOpacity style={styles.secondaryButton} onPress={chooseFromGallery}>
@@ -1778,7 +1815,7 @@ function Outfits({ outfits, onDelete, onRestore, onDeletePermanent, showOutfitSc
   };
   return <>
     <FlatList data={orderedOutfits} keyExtractor={(outfit) => outfit.id} initialNumToRender={8} maxToRenderPerBatch={8} windowSize={5} removeClippedSubviews={Platform.OS !== 'web'} contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false} ListHeaderComponent={<><View style={{ height: 18 }} /><View style={styles.wardrobeHeader}><Text style={styles.eyebrow}>HISTORIAL</Text><Text style={styles.title}>Tus outfits</Text><Text style={styles.addIntro}>{outfits.length} outfits analizados.</Text></View><View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}><TouchableOpacity onPress={() => setSortBy('date')} style={[styles.categoryFilter, sortBy === 'date' && styles.categoryFilterActive]}><Feather name="calendar" size={14} color={sortBy === 'date' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'date' && styles.categoryFilterTextActive]}>Más recientes</Text></TouchableOpacity>{showOutfitScore && <TouchableOpacity onPress={() => setSortBy('score')} style={[styles.categoryFilter, sortBy === 'score' && styles.categoryFilterActive]}><Feather name="star" size={14} color={sortBy === 'score' ? COLORS.white : COLORS.sageDark} /><Text style={[styles.categoryFilterText, sortBy === 'score' && styles.categoryFilterTextActive]}>Mejor puntuación</Text></TouchableOpacity>}</View></>} renderItem={({ item }) => <OutfitHistoryCard outfit={item} onOpen={() => setSelectedOutfit(item)} onDelete={() => deleteOutfit(item)} showOutfitScore={showOutfitScore} />} />
-    <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><CachedImage source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} contentFit="cover" cachePolicy="memory-disk" transition={120} /></TouchableOpacity>{selectedOutfit.styleGoal && <View style={{ alignSelf: 'flex-start', backgroundColor: '#F0F3EC', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 12 }}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>OBJETIVO: {selectedOutfit.styleGoal.toLocaleUpperCase('es')}</Text></View>}{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.fabricType} · {item.texture}</Text>{hasUsefulValue(item.materialEstimate) && <Text style={styles.cardMeta}>Composición aparente: {item.materialEstimate}</Text>}<Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
+    <Modal visible={selectedOutfit !== null} transparent animationType="slide" onRequestClose={() => setSelectedOutfit(null)}><View style={styles.detailBackdrop}><TouchableOpacity style={styles.filterModalDismiss} activeOpacity={1} onPress={() => setSelectedOutfit(null)} />{selectedOutfit && <View style={styles.editGarmentSheet}><View style={styles.filterModalHead}><View><Text style={styles.eyebrow}>DETALLE DEL OUTFIT</Text><Text style={styles.filterModalTitle}>{new Date(selectedOutfit.createdAt).toLocaleDateString('es-ES')}</Text></View><TouchableOpacity style={styles.filterClose} onPress={() => setSelectedOutfit(null)}><Feather name="x" size={20} color={COLORS.ink} /></TouchableOpacity></View><ScrollView showsVerticalScrollIndicator={false}><TouchableOpacity activeOpacity={0.9} onPress={() => setFullScreenImage(selectedOutfit.imageUri)}><CachedImage source={{ uri: selectedOutfit.imageUri }} style={{ width: '100%', height: 220, borderRadius: 18, marginBottom: 15 }} contentFit="cover" cachePolicy="memory-disk" transition={120} /></TouchableOpacity>{selectedOutfit.occasion && selectedOutfit.occasion !== NO_SPECIFIC_OCCASION && <View style={{ alignSelf: 'flex-start', backgroundColor: '#F0F3EC', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 12 }}><Text style={{ color: COLORS.sageDark, fontSize: 11, fontWeight: '800' }}>{isKnownOccasion(selectedOutfit.occasion) ? 'OCASIÓN' : 'OBJETIVO'}: {selectedOutfit.occasion.toLocaleUpperCase('es')}</Text></View>}{selectedOutfit.evaluation && <View style={styles.outfitEvaluation}><Text style={styles.evaluationTitle}>{showOutfitScore ? `Valoración · ${Math.round(selectedOutfit.evaluation.score)}/100` : 'Valoración del outfit'}</Text><Text style={styles.evaluationSummary}>{selectedOutfit.evaluation.summary}</Text>{selectedOutfit.evaluation.detectedStyles && selectedOutfit.evaluation.detectedStyles.length > 0 && <Text style={[styles.evaluationEyebrow, { marginTop: 11 }]}>ESTILO DETECTADO · {selectedOutfit.evaluation.detectedStyles.join(' · ').toLocaleUpperCase('es')}</Text>}{[...selectedOutfit.evaluation.strengths, ...(showImprovementPoints ? [...selectedOutfit.evaluation.improvements, ...selectedOutfit.evaluation.suggestions] : [])].map((text, index) => <Text key={index} style={styles.evaluationRowText}>• {text}</Text>)}</View>}<Text style={styles.evaluationTitle}>Prendas identificadas</Text>{selectedOutfit.garments.map((item, index) => <View key={index} style={{ backgroundColor: COLORS.white, borderRadius: 14, padding: 12, marginTop: 9 }}><Text style={styles.cardTitle}>{garmentTitle(item)}</Text><Text style={styles.cardMeta}>{item.category} · {item.subcategory}</Text><Text style={styles.cardMeta}>{item.primaryColor} · {item.brand || 'Marca no identificada'}</Text><Text style={styles.cardMeta}>{item.pattern} · {item.fabricType} · {item.texture}</Text>{hasUsefulValue(item.materialEstimate) && <Text style={styles.cardMeta}>Composición aparente: {item.materialEstimate}</Text>}<Text style={styles.cardMeta}>{item.styles.join(', ')} · Confianza {Math.round(item.confidence * 100)}%</Text></View>)}</ScrollView></View>}</View></Modal>
     <Modal visible={fullScreenImage !== null} transparent animationType="fade" onRequestClose={() => setFullScreenImage(null)}><View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}><TouchableOpacity onPress={() => setFullScreenImage(null)} style={{ position: 'absolute', top: 52, right: 20, zIndex: 2, width: 42, height: 42, borderRadius: 21, backgroundColor: 'rgba(255,255,255,0.9)', alignItems: 'center', justifyContent: 'center' }}><Feather name="x" size={22} color={COLORS.ink} /></TouchableOpacity>{fullScreenImage && <Image source={{ uri: fullScreenImage }} resizeMode="contain" style={{ width: '100%', height: '100%' }} />}</View></Modal>
     {recentlyDeleted && <View style={{ position: 'absolute', left: 20, right: 20, bottom: 22, minHeight: 54, borderRadius: 16, backgroundColor: COLORS.ink, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10, elevation: 6 }}><Text style={{ color: COLORS.white, fontSize: 12, fontWeight: '700' }}>Outfit eliminado</Text><TouchableOpacity onPress={undoDelete} style={{ paddingVertical: 10, paddingLeft: 16 }}><Text style={{ color: '#DDE7D6', fontSize: 12, fontWeight: '800' }}>Deshacer</Text></TouchableOpacity></View>}
   </>;
@@ -1860,6 +1897,8 @@ function Home({ items, displayName, onAdd, onCamera, onOpenWardrobe, onOpenProfi
 
 export default function App() {
   const [startupLoading, setStartupLoading] = useState(true);
+  const [adsReady, setAdsReady] = useState(false);
+  const [adPrivacyOptionsRequired, setAdPrivacyOptionsRequired] = useState(false);
   useEffect(() => {
     let active = true;
     let minimumElapsed = false;
@@ -1883,6 +1922,23 @@ export default function App() {
       clearTimeout(minimumTimer);
       clearTimeout(maximumTimer);
     };
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return undefined;
+    let mounted = true;
+    void (async () => {
+      try {
+        const consentInfo = await AdsConsent.gatherConsent();
+        if (mounted) setAdPrivacyOptionsRequired(consentInfo.privacyOptionsRequirementStatus === AdsConsentPrivacyOptionsRequirementStatus.REQUIRED);
+        if (!consentInfo.canRequestAds) return;
+        await mobileAds().initialize();
+        if (mounted) setAdsReady(true);
+      } catch (error) {
+        console.warn('[Anuncios] No se ha podido completar la inicialización:', error);
+      }
+    })();
+    return () => { mounted = false; };
   }, []);
 
   const [tab, setTab] = useState<Tab>('inicio');
@@ -2018,7 +2074,7 @@ export default function App() {
             thumbnailStoragePath: row.thumbnail_path || undefined,
             garments: (linksByOutfit.get(row.id) || []).map((id) => garmentsById.get(id)).filter((item): item is SavedGarment => Boolean(item)),
             evaluation: row.evaluation as OutfitEvaluation | null,
-            styleGoal: row.style_goal || '',
+            occasion: row.style_goal || NO_SPECIFIC_OCCASION,
             createdAt: row.taken_at || row.created_at,
           };
         } catch (error) {
@@ -2093,7 +2149,7 @@ export default function App() {
         image_path: uploadedOutfitPath,
         thumbnail_path: uploadedOutfit.thumbnailPath,
         evaluation: outfit.evaluation,
-        style_goal: outfit.styleGoal,
+        style_goal: outfit.occasion,
         taken_at: outfit.createdAt,
       }).select().single();
       if (outfitError || !outfitRow) throw new Error(outfitError?.message || 'No hemos podido guardar el outfit.');
@@ -2123,7 +2179,7 @@ export default function App() {
         thumbnailStoragePath: uploadedOutfit.thumbnailPath,
         garments: outfitLinks.map((link) => nextGarments.find((item) => item.id === link.garment_id)).filter((item): item is SavedGarment => Boolean(item)),
         evaluation: outfit.evaluation,
-        styleGoal: outfit.styleGoal,
+        occasion: outfit.occasion,
         createdAt: (outfitRow as DatabaseOutfitRow).taken_at,
       };
       setSavedGarments(nextGarments);
@@ -2231,13 +2287,25 @@ export default function App() {
     setTab('inicio');
     setOnboardingCompleted(false);
   };
+  const openAdPrivacyOptions = async () => {
+    try {
+      const consentInfo = await AdsConsent.showPrivacyOptionsForm();
+      setAdPrivacyOptionsRequired(consentInfo.privacyOptionsRequirementStatus === AdsConsentPrivacyOptionsRequirementStatus.REQUIRED);
+      if (consentInfo.canRequestAds && !adsReady) {
+        await mobileAds().initialize();
+        setAdsReady(true);
+      }
+    } catch (error) {
+      setNotice({ title: 'No hemos podido abrir la privacidad de anuncios', message: error instanceof Error ? error.message : 'Vuelve a intentarlo.' });
+    }
+  };
   if (startupLoading) return <StartupLoading />;
   if (authLoading || (session && wardrobeLoading)) return <SafeAreaView style={styles.safe}><StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} translucent={false} /><View style={styles.authLoading}><ActivityIndicator color={COLORS.sageDark} /><Text style={styles.authLoadingText}>Conectando con tu armario…</Text></View></SafeAreaView>;
   if (!session) return <LoginScreen />;
   if (!onboardingCompleted) return <OnboardingScreen initialName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || ''} initialGender={session.user.user_metadata?.gender_identity} initialStyles={session.user.user_metadata?.style_preferences} initialColors={session.user.user_metadata?.color_preferences} initialShops={session.user.user_metadata?.favorite_shops} initialShowOutfitScore={session.user.user_metadata?.show_outfit_score !== false} initialShowImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} onComplete={() => setOnboardingCompleted(true)} />;
   return <NoticeContext.Provider value={{ showNotice: setNotice }}><SafeAreaView style={styles.safe}>
     <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} />
-    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} displayName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'tu armario'} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} wardrobeItems={savedGarments} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} onDeletePermanent={deleteOutfitPermanently} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} /> : <EmptyScreen tab={tab} />}</View>
+    <View style={styles.app}>{tab === 'inicio' ? <Home items={savedGarments} displayName={session.user.user_metadata?.display_name || session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'tu armario'} onAdd={() => { setCaptureFromCamera(false); setTab('captura'); }} onCamera={() => { setCaptureFromCamera(true); setTab('captura'); }} onOpenWardrobe={(categoryKey = 'todas') => { setWardrobeInitialCategory(categoryKey); setTab('armario'); }} onOpenProfile={() => setTab('perfil')} /> : tab === 'captura' ? <AddOutfit startWithCamera={captureFromCamera} onSave={saveToWardrobe} wardrobeItems={savedGarments} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} adsReady={adsReady} /> : tab === 'armario' ? <Wardrobe items={savedGarments} initialCategory={wardrobeInitialCategory} onDelete={deleteFromWardrobe} onMerge={mergeWardrobeItems} onUpdate={updateWardrobeItem} /> : tab === 'outfits' ? <Outfits outfits={savedOutfits} onDelete={deleteOutfit} onRestore={restoreOutfit} onDeletePermanent={deleteOutfitPermanently} showOutfitScore={session.user.user_metadata?.show_outfit_score !== false} showImprovementPoints={session.user.user_metadata?.show_improvement_points !== false} /> : tab === 'perfil' ? <Profile onBack={() => setTab('inicio')} email={session.user.email} displayName={session.user.user_metadata?.display_name} onSignOut={() => void signOut()} onEditSetup={reopenOnboarding} onOpenAdPrivacy={adPrivacyOptionsRequired ? () => void openAdPrivacyOptions() : undefined} /> : <EmptyScreen tab={tab} />}</View>
     {tab !== 'perfil' && <View style={styles.nav}>
       {nav.map((item) => {
         const active = tab === item.key;
@@ -2277,7 +2345,7 @@ const styles = StyleSheet.create({
   productInfo: { flex: 1, padding: 8, paddingLeft: 15 }, shop: { fontSize: 8, letterSpacing: 1, color: COLORS.muted, fontWeight: '700', marginBottom: 8 }, productName: { color: COLORS.ink, fontWeight: '700', fontSize: 16, marginBottom: 7 }, productReason: { color: COLORS.muted, fontSize: 12, lineHeight: 17 }, priceRow: { marginTop: 'auto', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, price: { fontSize: 15, fontWeight: '700', color: COLORS.ink }, disclosure: { textAlign: 'center', color: '#9B958E', fontSize: 9, marginTop: 9 },
   nav: { height: 78, borderTopWidth: 1, borderTopColor: COLORS.line, backgroundColor: '#FFFEFC', flexDirection: 'row', paddingHorizontal: 8, paddingBottom: 7 }, navItem: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 4 }, navLabel: { fontSize: 10, color: '#96908A', fontWeight: '600' }, navLabelActive: { color: COLORS.sageDark }, addNav: { width: 50, height: 50, borderRadius: 25, backgroundColor: COLORS.clay, alignItems: 'center', justifyContent: 'center', marginTop: -22, shadowColor: COLORS.clay, shadowOpacity: 0.25, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 4 },
   empty: { flex: 1, paddingHorizontal: 34, alignItems: 'center', justifyContent: 'center' }, emptyIcon: { width: 74, height: 74, borderRadius: 37, backgroundColor: '#E5EBE0', alignItems: 'center', justifyContent: 'center', marginBottom: 20 }, emptyTitle: { fontSize: 25, color: COLORS.ink, fontWeight: '700', marginBottom: 10 }, emptyText: { fontSize: 14, lineHeight: 21, color: COLORS.muted, textAlign: 'center', maxWidth: 300 }, primaryButton: { marginTop: 26, backgroundColor: COLORS.clay, borderRadius: 16, paddingHorizontal: 22, paddingVertical: 14, flexDirection: 'row', alignItems: 'center', gap: 9 }, primaryButtonText: { color: '#fff', fontWeight: '700', fontSize: 14 },
-  loadingScreen: { flex: 1, overflow: 'hidden', backgroundColor: COLORS.paper }, preparationScreen: { flex: 1, overflow: 'hidden', backgroundColor: '#F3F5F0' }, loadingContent: { flex: 1, zIndex: 2, paddingHorizontal: 34, alignItems: 'center', justifyContent: 'center' }, loadingEyebrow: { color: COLORS.sageDark, fontSize: 10, fontWeight: '800', letterSpacing: 1.7, marginBottom: 22 }, loadingIcon: { width: 76, height: 76, borderRadius: 38, backgroundColor: COLORS.clay, alignItems: 'center', justifyContent: 'center', marginBottom: 26, shadowColor: COLORS.clay, shadowOpacity: 0.28, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 }, preparationIcon: { width: 76, height: 76, borderRadius: 24, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', marginBottom: 26, shadowColor: COLORS.sageDark, shadowOpacity: 0.24, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 }, loadingTitle: { color: COLORS.ink, fontSize: 25, lineHeight: 32, fontWeight: '700', textAlign: 'center', minHeight: 64, maxWidth: 310 }, loadingText: { color: COLORS.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', maxWidth: 300, marginTop: 10 }, loadingSpinner: { marginTop: 28 }, loadingDecorationTop: { position: 'absolute', width: 260, height: 260, borderRadius: 130, backgroundColor: '#E6ECE1', top: -110, right: -85 }, loadingDecorationBottom: { position: 'absolute', width: 220, height: 220, borderRadius: 110, backgroundColor: '#F0D9CF', bottom: -105, left: -80 },
+  loadingScreen: { flex: 1, overflow: 'hidden', backgroundColor: COLORS.paper }, preparationScreen: { flex: 1, overflow: 'hidden', backgroundColor: '#F3F5F0' }, loadingContent: { flex: 1, zIndex: 2, paddingHorizontal: 34, alignItems: 'center', justifyContent: 'center' }, loadingEyebrow: { color: COLORS.sageDark, fontSize: 10, fontWeight: '800', letterSpacing: 1.7, marginBottom: 22 }, loadingIcon: { width: 76, height: 76, borderRadius: 38, backgroundColor: COLORS.clay, alignItems: 'center', justifyContent: 'center', marginBottom: 26, shadowColor: COLORS.clay, shadowOpacity: 0.28, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 }, preparationIcon: { width: 76, height: 76, borderRadius: 24, backgroundColor: COLORS.sageDark, alignItems: 'center', justifyContent: 'center', marginBottom: 26, shadowColor: COLORS.sageDark, shadowOpacity: 0.24, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 }, loadingTitle: { color: COLORS.ink, fontSize: 25, lineHeight: 32, fontWeight: '700', textAlign: 'center', minHeight: 64, maxWidth: 310 }, loadingText: { color: COLORS.muted, fontSize: 13, lineHeight: 20, textAlign: 'center', maxWidth: 300, marginTop: 10 }, loadingSpinner: { marginTop: 28 }, loadingDecorationTop: { position: 'absolute', width: 260, height: 260, borderRadius: 130, backgroundColor: '#E6ECE1', top: -110, right: -85 }, loadingDecorationBottom: { position: 'absolute', width: 220, height: 220, borderRadius: 110, backgroundColor: '#F0D9CF', bottom: -105, left: -80 }, processingAdArea: { zIndex: 3, minHeight: 78, paddingTop: 7, paddingBottom: 8, borderTopWidth: 1, borderTopColor: COLORS.line, backgroundColor: 'rgba(247,244,239,0.96)', alignItems: 'center', justifyContent: 'flex-end' }, processingAdLabel: { color: COLORS.muted, fontSize: 7, fontWeight: '700', letterSpacing: 1.2, marginBottom: 4 }, processingAdBanner: { width: '100%', minHeight: 50, alignItems: 'center', justifyContent: 'center' },
   addScroll: { padding: 20, paddingBottom: 40 }, addHeader: { marginTop: 10, marginBottom: 24 }, addIntro: { color: COLORS.muted, fontSize: 14, lineHeight: 21, marginTop: 10, maxWidth: 340 },
   stepScroll: { padding: 20, paddingBottom: 44 }, backButton: { alignSelf: 'flex-start', height: 40, flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 3, marginBottom: 16 }, backButtonText: { color: COLORS.ink, fontSize: 13, fontWeight: '700' }, stepImage: { width: '100%', height: 230, borderRadius: 22, backgroundColor: COLORS.sand, marginBottom: 2 }, reviewHero: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.white, borderRadius: 20, padding: 10, marginBottom: 6 }, reviewImage: { width: 88, height: 112, borderRadius: 14, backgroundColor: COLORS.sand }, reviewHeroCopy: { flex: 1, paddingHorizontal: 15 }, reviewHeroTitle: { color: COLORS.ink, fontSize: 20, fontWeight: '700', marginBottom: 5 }, reviewHeroText: { color: COLORS.muted, fontSize: 11, lineHeight: 16 },
   duplicateScroll: { padding: 20, paddingBottom: 42 }, duplicateTitle: { color: COLORS.ink, fontSize: 27, lineHeight: 34, fontWeight: '700', marginTop: 7 }, duplicateIntro: { color: COLORS.muted, fontSize: 13, lineHeight: 20, marginTop: 9, maxWidth: 345 }, duplicateCounter: { alignSelf: 'flex-start', backgroundColor: '#E8EEE3', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginTop: 16, marginBottom: 13 }, duplicateCounterText: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800' }, comparisonRow: { flexDirection: 'row', alignItems: 'center' }, comparisonColumn: { flex: 1, alignSelf: 'flex-start' }, comparisonLabel: { color: COLORS.muted, fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 7 }, comparisonImage: { width: '100%', height: 230, borderRadius: 17, backgroundColor: COLORS.sand }, bestPhotoBadge: { position: 'absolute', left: 7, bottom: 7, height: 23, borderRadius: 12, backgroundColor: COLORS.sageDark, paddingHorizontal: 8, flexDirection: 'row', alignItems: 'center', gap: 4 }, bestPhotoBadgeText: { color: COLORS.white, fontSize: 8, fontWeight: '800' }, comparisonName: { color: COLORS.ink, fontSize: 12, lineHeight: 17, fontWeight: '700', marginTop: 9 }, comparisonUses: { color: COLORS.clay, fontSize: 9, fontWeight: '800', marginTop: 4 }, comparisonDivider: { width: 38, alignItems: 'center' }, comparisonVs: { color: COLORS.muted, fontSize: 9, fontWeight: '900' }, duplicateClues: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#E8EEE3', borderRadius: 15, padding: 13, marginTop: 18, marginBottom: 10 }, duplicateCluesText: { flex: 1, color: COLORS.sageDark, fontSize: 10, lineHeight: 15 }, duplicateReason: { backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, padding: 13, marginBottom: 14 }, duplicateReasonTitle: { color: COLORS.sageDark, fontSize: 9, fontWeight: '800', letterSpacing: 0.7, marginBottom: 5 }, duplicateReasonText: { color: COLORS.muted, fontSize: 11, lineHeight: 16 }, sameGarmentButton: { minHeight: 58, borderRadius: 17, backgroundColor: COLORS.sageDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 16 }, sameGarmentButtonTitle: { color: COLORS.white, fontSize: 13, fontWeight: '800' }, sameGarmentButtonText: { color: '#DDE5D8', fontSize: 9, marginTop: 3 }, differentGarmentButton: { minHeight: 58, borderRadius: 17, borderWidth: 1, borderColor: '#BFC8B8', backgroundColor: COLORS.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 16, marginTop: 10 }, differentGarmentButtonTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '800' }, differentGarmentButtonText: { color: COLORS.muted, fontSize: 9, marginTop: 3 },
